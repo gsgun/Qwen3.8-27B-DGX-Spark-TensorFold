@@ -1,0 +1,150 @@
+0007 — TP=2 multi-stream batched-verification gate (C=4 scaling audit)
+========================================================================
+
+Background / root cause
+-----------------------
+With 0006 (fused W8A16) live on the Qwen3.8-27B-8bit TP=2 pair
+(spark1 .139 / spark2 .150, TensorFold v0.6.0), C=1 with DFlash2 measured
+32.2 tok/s (prose) / 71.5 tok/s (code) while "C=4 x 512 with DFlash2"
+measured only 24.5 tok/s aggregate — an apparent multi-stream inversion.
+
+Phase 1 read-only audit (2026-10-23) found NO B>1 code defect:
+
+1. The 24.5 tok/s figure was a harness artifact, not an engine defect.
+   The original bench script compared the draft flag as d=="true" while
+   invoking with D=on, so every "C=4 DFlash2" request went out as
+   draft:false. 4 streams x 1 token / 163 ms (draft-off floor) = 24.5
+   tok/s — matches the "inverted" measurement to the decimal. A second
+   harness bug (aggregator reading stale draft-false JSON paths)
+   reproduced the same number.
+
+2. DFlash2 multi-stream bypass (hypothetical): ABSENT.
+   multi.py:427-431 puts every stream's draft block into ONE drafter
+   pass; multi.py:442-444 issues ONE multi_tree_forward per round with
+   all streams' windows in a single W-row batch (forward.py:300-317).
+   decode_tp.py is the C=1-only path; Multi (multi.py) handles B>1.
+
+3. Drafter per-slot loops (hypothetical): ABSENT.
+   dflash2.py:189/257 the fast path is REQUIRED under TP=2
+   (fast and bits==4); dflash2.py:503-510 runs one batched _layer_fast
+   per layer over the concatenated token tensor; dflash2.py:532-541
+   exactly 2 all_gather_into_tensor per round, batch-wide.
+
+4. GDN/attention per-slot collectives (hypothetical): ABSENT.
+   forward.py:357 one deltanet.tree per GDN layer; forward.py:376 one
+   tree_attention per attention layer; forward.py:432/441 one
+   deltanet.replay "covers all layers and streams"; forward.py:483
+   torch._foreach_copy_ KV commit. Zero dist.* calls in forward.py.
+
+5. TP collective count (authoritative, distributed.py):
+   split_layer (distributed.py:101-133): column-parallel linears
+   (attn.q/k/v, gdn.qkv/z/b/a, mlp.gate/up) = no collective;
+   row-parallel linears = 1 all_gather_into_tensor each
+   (distributed.py:267-284, default op; all_reduce only under
+   TF_TP_REDUCE=allreduce). Each of the 64 layers is EITHER GDN
+   (gdn.out + mlp.down) OR attention (attn.o + mlp.down) = 2
+   collectives -> total 128 per forward, COUNT B-INVARIANT (payload
+   scales with rows). Live-confirmed: 128.0 stable across 800+ rounds.
+   row_partial stored-layout cap: 128 rows (distributed.py:240).
+   max_rows=16 (multi.py:86-90) is PER STREAM — C=4 full trees fit.
+
+6. 0006 W8A16 kernel at M=32: FLAT.
+   Micro-bench at the real per-rank shape (N=17408 K=2560 GS=64):
+   M=1/4/8/32 = 0.244/0.246/0.248/0.264 ms/layer (+8% over 32x rows,
+   memory-bound ~180 GB/s). The +44 ms/round M=8->32 in the engine cost
+   curve is GDN tree compute + attention KV reads + NCCL payload, not
+   the W8A16 matmul.
+
+Live log audit: 0006 fast-path shape histogram (2,473,150 calls,
+fallback: 0) shows M = total window rows across all streams in a single
+GEMM (M=32/64 entries present at C=4; zero per-stream M=8 calls) —
+the scheduler already batches exactly what this patch was scoped to add.
+
+Measured result with drafts genuinely on (temp=0, enable_thinking=false,
+512 tok/stream, same-session C=1 baseline):
+  Prose: C=1 29.3  C=2 46.5 (1.59x)  C=4 75.5 (2.58x)
+  Code:  C=1 60.8  C=2 97.4 (1.60x)  C=4 139.9-152 (2.30-2.50x)
+  Greedy parity: C=4 streams byte-identical to C=1 (prose
+  d5589b366369, code 39191bf72982); concurrent same-prompt streams
+  identical to each other — no cross-stream KV/GDN state bleed.
+
+Conclusion: the stock TP=2 scheduler already implements the batched
+verification this patch's scope described. 0007 therefore ships as a
+gate + invariant verification + harness fixes (user decision A): the
+batched behavior becomes explicit, continuously checked, and
+one-env-var revertible.
+
+What ships
+----------
+1. /patches/tp2batchverify.py (new, top-level module, mirrors the
+   0006 tp2w8a16.py pattern):
+     TP2_BATCH_VERIFY=1 (default) - installs three lightweight hooks:
+       - multi.MultiDecoder._verify        (round boundary)
+       - multi.multi_tree_forward          (target-forward count)
+       - distributed.gather_rank_partials  (collective count; patched on
+         the distributed module because forward.py:30 and dflash2.py:481
+         import it function-locally and re-resolve the attribute on
+         every call)
+     Bookkeeping only: two function calls per round. Optional stderr
+     summary every 50 rounds via TP2_BATCH_VERIFY_DIAG=1:
+       tp2batchverify: rounds=50 streams=200 rows=... fwd/round=1.00
+                       target-colls/round=128.0 OK
+     Invariants: exactly 1 multi_tree_forward per round and 128 target
+     collectives per forward (2 per layer: {attn.o|gdn.out} + mlp.down). Drafter
+     gathers (its own row-parallel linears + 2 candidate gathers) are
+     counted in the total but not in the target invariant. A violated
+     invariant logs one WARN line per rank.
+     TP2_BATCH_VERIFY=0 - kill-switch: install() returns before any
+     hook; pure stock path (mirrors TP2_W8A16=0 restoring the stock
+     kernel).
+
+2. /patches/tensorfold/__init__.py (+ staged tensorfold_init.py):
+   appended 0007 install block after the 0006 block, same
+   fail-soft pattern ("an optional patch must never break the server").
+
+3. launch-tp2.sh: new env line (both nodes):
+   -e TP2_BATCH_VERIFY="${TP2_BATCH_VERIFY:-1}" \
+   -e TP2_BATCH_VERIFY_DIAG="${TP2_BATCH_VERIFY_DIAG:-1}" \
+   (diag=1 in production, matching the TP2_W8A16_DIAG=1 precedent —
+   continuous invariant evidence for the log-audit item.)
+
+4. Harness v4 (bench/): w8a16_cn.sh / w8a16_c4.sh — label+concurrency
+   keyed request/response paths (w8a16_<label>_c<N>_<i>.json), rm -f
+   stale files first, draft flag set via argv comparison (draft:
+   sys.argv[2]=='true') and echoed per request. Fixes both artifact
+   bugs (flag compare, stale-JSON reuse) plus the _c4_ hardcoded
+   response suffix.
+
+Rollback
+--------
+TP2_BATCH_VERIFY=0 in launch-tp2.sh (or env) and one boot cycle:
+0007 installs nothing, engine runs pure stock v0.6.0 + 0006. Or delete
+patches/tp2batchverify.py and revert the two appended __init__ lines
+(pre-patch copies: .bak-0007 in each node's patches/ dir). No image
+state is modified at any point.
+
+Verification battery
+--------------------
+1. Fresh-interpreter import chain (both flag states):
+   =1: all three hooks report module tp2batchverify; banner
+       "tp2batchverify: installed (TP2_BATCH_VERIFY=1)"; 0006 banner
+       unaffected.
+   =0: all three names un-wrapped (multi/forward/distributed
+       originals); no 0007 banner.
+2. Post-boot diag (both ranks, every 50-round window, incl. C=4 runs):
+   tp2batchverify: rounds=150 streams=583 rows=5493 fwd/round=1.00
+   target-colls/round=128.0 (expect 128.0) OK
+   (Boot #1, pre-correction, printed '128.0 WARN batch invariant' against
+   the 192 constant — the invariant checker caught the audit
+   miscount on first live traffic. 128 = 2 x 64: each layer is either
+   GDN (gdn.out) or attention (attn.o) plus mlp.down.)
+3. Greedy parity re-check after boot (C=1, temp=0, drafts on):
+   prose d5589b366369 (1735 chars), code 39191bf72982 (2045 chars) —
+   byte-identical to pre-0007 shas; 0007 changed no numerics.
+4. C=4 smoke after boot (harness v4, draft=true x4, 512 tok/stream):
+   c4prose: tokens=2048 wall=24.15s agg=84.79 tok/s (rounds=115)
+   c4code:  tokens=2048 wall=14.99s agg=136.61 tok/s (rounds=53)
+5. Endpoints: :8894/health {"ok": true} on spark1; LiteLLM :4000
+   /health/liveliness "I'm alive!" on the local host (NOT on spark1);
+   llama-swap :8888 OK on spark1. Rank1 (.150) diag lines identical
+   to rank0.

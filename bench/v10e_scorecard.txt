@@ -1,0 +1,22 @@
+v10e (3ccfeb2b) Production Scorecard — 2026-10-25
+====================================================
+Leg      | v9 boot76 | v10e      | Delta   | Target
+---------|-----------|-----------|---------|--------
+p1d      | 45.92     | 45.37     | -1.2%   | ~48
+c1d      | 92.80     | 94.07     | +1.4%   | ~97
+p4d      | 120.77    | 121.45    | +0.6%   | 128-135
+c4d      | 180.09    | 208.00    | +15.5%  | 210-225
+m4d      | 120.17    | 125.30    | +4.3%   | --
+c4off    | 38.37     | 38.63     | +0.7%   | --
+
+0007 gate: target-colls/round=128.0, draft-colls/round=0.0  PASS
+Parity: C=1+C=4, prose+code = 14/14 byte-exact              PASS
+  C=1 p: d5589b366369  C=1 c: 39191bf72982
+  C=4 p: d5589b366369 x4  C=4 c: 39191bf72982 x4
+
+Design: v9 base + eager static-buffer staging for ALL S in {1,2,3,4}
+        (no CUDA graph). Fused _dg_block_attention kernel for S>1.
+        CUDA graph replay broken on boot78+ (4.6x slow, all versions).
+        v10-graph (96fccac9) parked for clean-boot testing.
+
+Promotion: c4d +15.5% (180.1 -> 208.0), 14/14 parity. GATE MET.

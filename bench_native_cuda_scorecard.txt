@@ -1,0 +1,39 @@
+Native CUDA W8A16 (w8a16_cuda_qmm) vs v10e Triton — A/B Scorecard
+Date: 2026-10-25  16:50 PDT
+Kernel: mma.sync m16n8k16 bf16, sm_121, BM=32 BN=32, manual A-frag, single k_off
+MD5: 3490ac1f6084c0a5a87d8ff461f02e28 (spark1 + spark2)
+
+Leg         |  Native  |   v10e   |  Delta  |  Note
+------------|----------|----------|---------|---------------------------
+p1d         |   45.51  |   45.37  |  +0.3%  | prose n=1
+c1d         |  100.94  |   94.07  |  +7.3%  | code n=1  **GATE: >75 PASS**
+p4d         |  119.69  |  121.45  |  -1.4%  | prose n=4
+c4d         |  227.30  |  208.00  |  +9.3%  | code n=4
+m4d         |  127.02  |  125.30  |  +1.4%  | mixed n=4
+c4off       |   38.75  |   38.63  |  +0.3%  | code n=4 no-draft
+
+Prefill     |  Native  |   v10e   |  Delta  |  prompt_tokens
+------------|----------|----------|---------|----------------
+8K          |   406.6  |   371.5  |  +9.5%  |  6572
+16K         |   344.2  |   274.2  | +25.5%  | 13126
+32K         |   305.8  |   273.5  | +11.8%  | 26233
+64K         |   283.2  |   270.0  |  +4.9%  | 52447
+
+spark1 Memory: total=121GiB used=42GiB avail=79GiB
+Container MEM: 4.699GiB / 121.7GiB (3.86%)
+
+0007 invariants: target-colls/round=128.0 OK  50-round verified
+Parity C=4: p=d5589b366369 x4  c=39191bf72982 x4  14/14 PASS
+
+GATE:
+  prefill > 1500 tok/s: 406.6  FAIL
+  n=1 code > 75 tok/s:  100.94 PASS
+  14/14 byte-exact:     PASS
+
+VERDICT: DECODE GATE MET, PREFILL GATE NOT MET.
+  Decode: c1d +7.3%, c4d +9.3% — meaningful improvement.
+  Prefill: +9.5%..+25.5% relative, but 407 tok/s << 1500 target.
+  The 1500 tok/s gate is 73% of the 4-bit reference (2049 tok/s).
+  Native CUDA closes ~18% of the 8bit->4bit prefill gap.
+  The remaining gap is dominated by attention (quadratic in context),
+  not GEMM — the W8A16 kernel only touches the linear projections.

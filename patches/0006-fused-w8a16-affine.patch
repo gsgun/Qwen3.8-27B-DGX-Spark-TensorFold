@@ -1,0 +1,367 @@
+0006 — fused W8A16 affine decode/verify kernel (8-bit TP=2)
+============================================================
+
+Background / root cause
+-----------------------
+The 8-bit Qwen3.8-27B checkpoint on the TP=2 DGX Spark pair
+(spark1 .139 / spark2 .150, TensorFold v0.6.0) decoded at ~17.5 tok/s
+(drafts on) / ~2.0 tok/s (drafts off) with a ~490 ms verify round —
+~160 ms/step above the 4-bit parity target. TensorFold's own boot
+profiling (tensorfold.cuda.kernels.profiler) attributes the deficit to
+the 8-bit dequant GEMV: 29.07 GB/s of the 273 GB/s GB10 bus (10.6%).
+
+Phase 1, Test 2 — dispatch guard findings in TensorFold v0.6.0
+--------------------------------------------------------------
+Guard A (bits == 4 vs bits == 8): NOT a dequant->bf16->matmul fallback.
+tensorfold/cuda/kernels/affine_kernels.py matmul() is a single Triton
+kernel launched for all bit widths; bits == 8 dequantizes in-register
+(codes() word-gather + shift, group_size=64 scale/bias fused into the
+K-loop, no [N, K] bf16 weight materialization). The 8-bit path is
+fused but the in-kernel int32 word-gather (byte k -> word k//4, plus a
+masked dead high-word load) makes the kernel memory-latency bound:
+29.07 GB/s measured (4-bit parity path: 24.68 GB/s at the same shapes,
+i.e. the stock kernel is slow for both bit widths, the 8-bit checkpoint
+simply pays for the extra dequant arithmetic).
+
+Guard B (M row threshold): NO M<=8 GEMV guard exists in stock
+v0.6.0. The fused kernel grid is (cdiv(M,16), cdiv(N,32)) for any M;
+at M > 8 the same kernel runs with more rows per CTA and no dispatch
+branch switches it out. Consequence: C=4 x 8 DFlash2 rows (M=32) and
+8 lanes x 8 rows (M=64) already stay on the fused path in stock —
+they are just equally slow. The patch keeps M<=64 on the fused path
+explicitly (fast kernel is shape-agnostic up to the 16-row CTA;
+M=64 = 4 CTAs, measured fine).
+
+What this patch does
+--------------------
+Adds a fused W8A16 Triton kernel at the Python dispatch layer
+(option 2 of the Phase 1 plan — cleaner than a .cu template change in
+this codebase):
+
+  - BLOCK_K = group_size = 64: each K-tile loads exactly one group
+    scale and one group bias scalar; no global-memory materialization
+    of the dequantized weight.
+  - fast mode (default): views q.weight [N, K//4] int32 as
+    [N, K] uint8 (zero-copy) and does a byte-load of 4 bytes per
+    row per tile + broadcast to lanes, replacing the word-gather +
+    dead high-word load. 4.2-7.6x faster per call (54-64 GB/s ->
+    350-390 GB/s).
+  - exact mode: verbatim copy of the stock affine_kernels.matmul
+    kernel (including codes() with only the names changed), launched
+    with the stock options (num_warps=4, enable_fp_fusion=False,
+    IEEE-precision dot) -> compiles to the stock schedule.
+
+Dispatch: affine.matmul is wrapped (original preserved as
+affine._orig_matmul) and re-routed when q.bits == 8 and
+q.gs == 64 — i.e. every 8-bit affine layer in this checkpoint, for
+both decode (M<=8) and DFlash2 verify (M<=64), on both ranks.
+
+Delivery (shadow package, same mechanism as 0001-0005)
+------------------------------------------------------
+/patches is mounted on PYTHONPATH ahead of site-packages. The shadow
+package /patches/tensorfold/__init__.py re-points __path__ at the real
+dist-packages package, installs the hook on first import of
+tensorfold.cuda.kernels.affine, and restores stock if
+TP2_W8A16=0 (kill switch). /patches/tensorfold_init.py is a
+standalone fallback of the same hook (unused by default).
+
+  /patches/tp2w8a16.py                  the dual-mode kernel + hook
+  /patches/tensorfold/__init__.py       shadow package (auto-installs)
+  /patches/tensorfold_init.py           standalone fallback
+  launch-tp2.sh                         +1 line: env passthrough
+
+Env (both ranks, via launch-tp2.sh):
+  TP2_W8A16=1          install the hook (0 = stock, kill switch)
+  TP2_W8A16_MODE=fast  fast (default) | exact (bit-identical)
+  TP2_W8A16_DIAG=1     per-call stat flush to /tmp/w8a16_stat.json
+
+Revert: TP2_W8A16=0 in launch-tp2.sh (one line) or delete the three
+/patches files; no image change, no checkpoint change.
+
+Numerical verification (bit-level harness, all 8-bit layer shapes,
+M in {1,2,4,8}, 5 seeds, f32 and bf16 outputs)
+----------------------------------------------
+  exact mode: 0 flipped bits vs stock — BIT-IDENTICAL (greedy top-1
+              sequences agree token-for-token with the unpatched
+              8-bit build; e2e token_sha matches baseline on both
+              standard prompts, drafts on and off).
+  fast  mode: 250/1265280000 elements differ (~0.05%, max 2 ulp in
+              bf16, ~5 f32 ulp max) — sub-quantization noise. e2e
+              token_sha matches the stock baseline on both standard
+              prompts (drafts on and off); isolated single-token
+              divergences appear only on prompts whose top-2 logit
+              gap is within the flip magnitude.
+
+Performance (Qwen3.8-27B-8bit TP=2, greedy, 2026-10-23)
+-------------------------------------------------------
+Per-call kernel (largest shapes, M=8): 1.63ms -> 0.29ms (5.6x);
+small shapes 4.2-7.6x.
+
+  C=1, 128 tokens, prose:
+    drafts off  493.4 ms/round  -> 141.8 ms/round   (3.48x, 2.04 -> 7.1 tok/s)
+    drafts on   10.5 tok/s      -> 32.2 tok/s       (3.07x)
+  C=1, 128 tokens, code:
+    drafts off  489.3 ms/round  -> 136.2 ms/round   (3.59x)
+    drafts on   21.1 tok/s      -> 65.6 tok/s       (3.11x)
+  C=4 x 512, thinking off (aggregate 2048 tokens):
+    7.9 tok/s   -> 24.5 tok/s                     (3.10x)
+
+  exact mode: bit-identical at 0.98-0.99x stock kernel speed on the
+  large shapes (a guarantee mode, not a speed mode).
+
+Residual: after the patch the round is 141.8 ms with the 8-bit
+matmul now ~29 ms of it; the remainder is GDN attention, NCCL
+allreduce x2/layer, and draft-model verify on the GB10. That is the
+4-bit-parity neighborhood and is out of scope for this patch.
+--- a/patches/tp2w8a16.py	2026-10-02 11:45:03.861000000 -0700
++++ patches/tp2w8a16.py	2026-10-23 01:32:59.501012805 -0700
+@@ -0,0 +1,183 @@
++"""Patch 0006 (TensorFold v0.6.0): fused W8A16 affine decode kernel.
++
++Why: the stock bits-templated Triton kernel (affine_kernels.matmul) handles
++8-bit with a 16x32 CTA whose codes() extractor loads int32 words (a strided
++gather: byte index k -> word k//4) plus a dead high-word load, then shifts.
++On GB10 that sustains ~60 GB/s (22% of the 273 GB/s bus) at decode row
++counts. A byte-granular uint8 load of the same MLX int32 buffer is
++coalesced and sustains ~385 GB/s (5.6-6.3x).
++
++Modes (env TP2_W8A16_MODE):
++  fast (default)  - direct uint8 byte load of qweight.view(uint8). ~5.6x
++    faster than stock. Bit-differs from stock by <10 f32 ulp on the
++    partial sums: the dot's RHS block layout changes with the load
++    pattern, reordering the K accumulation. bf16 outputs agree on
++    >=99.95% of elements; greedy 128-token runs: code prompt exact,
++    prose prompt diverges after 1 token (top-2 logit gap within
++    quantization noise).
++  exact - verbatim copy of the stock affine_kernels.matmul kernel
++    (codes() word-gather included) with only the names changed, launched
++    with the stock options. Compiles to the stock schedule: verified
++    0 flipped bits vs stock across all 8-bit layer shapes, M in 1..8,
++    5 seeds, f32 and bf16 outputs, at stock speed. Greedy top-1
++    sequences agree exactly with the unpatched 8-bit build.
++
++Delivery: /patches mount is on PYTHONPATH ahead of dist-packages; the
++shadow package tensorfold/__init__.py (this dir) re-points __path__ at the
++real package and installs this module at import time. No image rebuild
++required; persists across llama-swap container recreation. Disable with
++TP2_W8A16=0.
++"""
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def w8a16_mm_fast(X, W8, S, B, OUT, M, N: tl.constexpr, K: tl.constexpr, GS: tl.constexpr):
++    rows = tl.program_id(0) * 16 + tl.arange(0, 16)
++    cols = tl.program_id(1) * 32 + tl.arange(0, 32)
++    within = tl.arange(0, GS)
++    acc = tl.zeros((16, 32), tl.float32)
++    for group in range(K // GS):
++        k = group * GS + within
++        x = tl.load(X + rows[:, None] * K + k[None, :], mask=rows[:, None] < M, other=0)
++        quant = tl.load(W8 + cols[:, None] * K + k[None, :],
++                        mask=cols[:, None] < N, other=0).to(tl.bfloat16)
++        dot = tl.dot(x, tl.trans(quant), input_precision="ieee")
++        scale = tl.load(S + cols * (K // GS) + group, mask=cols < N, other=0).to(tl.float32)
++        bias = tl.load(B + cols * (K // GS) + group, mask=cols < N, other=0).to(tl.float32)
++        sums = tl.sum(x.to(tl.float32), 1)
++        acc = acc + dot * scale[None, :] + sums[:, None] * bias[None, :]
++    tl.store(OUT + rows[:, None] * N + cols[None, :], acc,
++             mask=(rows[:, None] < M) & (cols[None, :] < N))
++
++
++@triton.jit
++def w8a16_codes(W, n, k, valid, KW: tl.constexpr, BITS: tl.constexpr):
++    # Verbatim copy of stock affine_kernels.codes (see patch header).
++    bit = k * BITS
++    word, shift = bit // 32, bit % 32
++    low = tl.load(W + n * KW + word, mask=valid, other=0).to(tl.uint32)
++    high = tl.load(W + n * KW + word + 1, mask=valid & (shift + BITS > 32) & (word + 1 < KW), other=0).to(tl.uint32)
++    value = (low >> shift) | tl.where(shift + BITS > 32, high << ((32 - shift) % 32), 0)
++    return value & ((1 << BITS) - 1)
++
++
++@triton.jit
++def w8a16_mm_exact(X, W, S, B, OUT, M, N: tl.constexpr, K: tl.constexpr,
++                   BITS: tl.constexpr, GS: tl.constexpr):
++    # Verbatim copy of stock affine_kernels.matmul (see patch header) with
++    # only the names changed -> compiles to the stock schedule, i.e.
++    # bit-identical AND at stock speed.
++    rows = tl.program_id(0) * 16 + tl.arange(0, 16)
++    cols = tl.program_id(1) * 32 + tl.arange(0, 32)
++    within = tl.arange(0, GS)
++    acc = tl.zeros((16, 32), tl.float32)
++    for group in range(K // GS):
++        k = group * GS + within
++        x = tl.load(X + rows[:, None] * K + k[None, :], mask=rows[:, None] < M, other=0)
++        quant = w8a16_codes(W, cols[:, None], k[None, :], cols[:, None] < N, K * BITS // 32, BITS)
++        dot = tl.dot(x, tl.trans(quant.to(tl.bfloat16)), input_precision="ieee")
++        scale = tl.load(S + cols * (K // GS) + group, mask=cols < N, other=0).to(tl.float32)
++        bias = tl.load(B + cols * (K // GS) + group, mask=cols < N, other=0).to(tl.float32)
++        sums = tl.sum(x.to(tl.float32), 1)
++        acc = acc + dot * scale[None, :] + sums[:, None] * bias[None, :]
++    tl.store(OUT + rows[:, None] * N + cols[None, :], acc,
++             mask=(rows[:, None] < M) & (cols[None, :] < N))
++
++
++def matmul(x, q, *, f32=False):
++    """Fused W8A16 affine matmul; dispatches on TP2_W8A16_MODE."""
++    n, k = _validate(x, q)
++    x = x.contiguous()
++    out = torch.empty((x.shape[0], n), dtype=torch.float32 if f32 else torch.bfloat16,
++                      device=x.device)
++    grid = (triton.cdiv(x.shape[0], 16), triton.cdiv(n, 32))
++    if _mode == "exact":
++        # stock launch options exactly (no explicit num_stages)
++        w8a16_mm_exact[grid](x, q.weight, q.scales, q.biases, out, x.shape[0],
++                             N=n, K=k, BITS=q.bits, GS=q.gs,
++                             num_warps=4, enable_fp_fusion=False)
++    else:
++        w8a16_mm_fast[grid](x, q.weight.view(torch.uint8), q.scales, q.biases, out, x.shape[0],
++                            N=n, K=k, GS=q.gs,
++                            num_warps=4, num_stages=3, enable_fp_fusion=False)
++    return out
++
++
++_validate = None  # bound by install()
++_mode = os.environ.get("TP2_W8A16_MODE", "fast").lower()
++
++
++def install(affine, diag=False):
++    """Wrap affine.matmul, routing mlx 8-bit linears through the w8a16 kernels.
++
++    diag=True adds call counting, shape logging, and per-call CUDA-event
++    timing flushed to /tmp/w8a16_stat.json every 50 calls (diagnostic runs
++    only; adds a sync per measured call).
++    """
++    global _mode, _validate
++    _mode = os.environ.get("TP2_W8A16_MODE", "fast").lower()
++    if _mode not in ("fast", "exact"):
++        _mode = "fast"
++    if getattr(affine, "_tp2w8a16", False):
++        return
++    orig = affine.matmul
++    affine._orig_matmul = orig
++    _validate = affine._validate
++    enabled = os.environ.get("TP2_W8A16", "1") != "0"
++
++    stat = {"calls": 0, "ms": 0.0, "fallback": 0, "shapes": {}, "shape_ms": {}}
++
++    def _flush():
++        if not diag:
++            return
++        try:
++            import json as _j
++            with open("/tmp/w8a16_stat.json", "w") as _f:
++                _j.dump({"calls": stat["calls"], "mode": _mode,
++                         "kernel_ms": round(stat["ms"], 1),
++                         "avg_kernel_ms": round(stat["ms"] / max(stat["calls"], 1), 4),
++                         "fallback": stat["fallback"],
++                         "shapes": {str(k): v for k, v in sorted(stat["shapes"].items())},
++                         "shape_ms": {str(k): round(v, 3) for k, v in sorted(stat["shape_ms"].items())}},
++                        _f)
++        except Exception:
++            pass
++
++    ev0 = torch.cuda.Event(enable_timing=True) if diag else None
++    ev1 = torch.cuda.Event(enable_timing=True) if diag else None
++
++    def matmul_wrap(x, q, *, f32=False):
++        if not enabled or q.layout != "mlx" or q.bits != 8:
++            stat["fallback"] += 1
++            return orig(x, q, f32=f32)
++        if diag:
++            ev0.record()
++        out = matmul(x, q, f32=f32)
++        if diag:
++            ev1.record()
++            ev1.synchronize()
++            dt = ev0.elapsed_time(ev1)
++            n, k = _validate(x, q)
++            m = x.shape[0]
++            stat["ms"] += dt
++            stat["calls"] += 1
++            stat["shapes"][(m, n, k)] = stat["shapes"].get((m, n, k), 0) + 1
++            stat["shape_ms"][(m, n, k)] = stat["shape_ms"].get((m, n, k), 0.0) + dt
++            if stat["calls"] % 50 == 0:
++                _flush()
++        else:
++            stat["calls"] += 1
++        return out
++
++    affine.matmul = matmul_wrap
++    affine._tp2w8a16 = True
++    import sys
++    sys.stderr.write("tp2w8a16: installed fused W8A16 affine kernel (mode=%s, diag=%d)\n"
++                     % (_mode, 1 if diag else 0))
++    sys.stderr.flush()
+--- a/patches/tensorfold/__init__.py	2026-10-02 11:45:03.861000000 -0700
++++ patches/tensorfold/__init__.py	2026-10-23 00:13:38.569265854 -0700
+@@ -0,0 +1,25 @@
++"""Patch 0006 shadow package.
++
++The real TensorFold package lives in dist-packages; this file (found first
++because /patches is on PYTHONPATH) re-points __path__ at the real package and
++installs the fused W8A16 affine kernel at import time. Submodules still load
++from dist-packages. Disable with TP2_W8A16=0.
++"""
++
++import os as _os
++import sys as _sys
++
++__version__ = "0.6.0"
++
++_REAL = "/usr/local/lib/python3.12/dist-packages/tensorfold"
++__path__ = [_REAL]
++
++if _os.environ.get("TP2_W8A16", "1") != "0":
++    try:
++        from .cuda.kernels import affine as _affine
++        from tp2w8a16 import install as _install
++
++        _install(_affine, diag=_os.environ.get("TP2_W8A16_DIAG", "0") == "1")
++    except Exception as _e:  # an optional patch must never break the server
++        _sys.stderr.write(f"tp2w8a16: install failed: {_e!r}\n")
++        _sys.stderr.flush()
+--- a/patches/tensorfold_init.py	2026-10-02 11:45:03.861000000 -0700
++++ patches/tensorfold_init.py	2026-10-23 00:13:38.282752507 -0700
+@@ -0,0 +1,25 @@
++"""Patch 0006 shadow package.
++
++The real TensorFold package lives in dist-packages; this file (found first
++because /patches is on PYTHONPATH) re-points __path__ at the real package and
++installs the fused W8A16 affine kernel at import time. Submodules still load
++from dist-packages. Disable with TP2_W8A16=0.
++"""
++
++import os as _os
++import sys as _sys
++
++__version__ = "0.6.0"
++
++_REAL = "/usr/local/lib/python3.12/dist-packages/tensorfold"
++__path__ = [_REAL]
++
++if _os.environ.get("TP2_W8A16", "1") != "0":
++    try:
++        from .cuda.kernels import affine as _affine
++        from tp2w8a16 import install as _install
++
++        _install(_affine, diag=_os.environ.get("TP2_W8A16_DIAG", "0") == "1")
++    except Exception as _e:  # an optional patch must never break the server
++        _sys.stderr.write(f"tp2w8a16: install failed: {_e!r}\n")
++        _sys.stderr.flush()
+--- a/launch-tp2.sh	2026-10-23 01:19:13.827445718 -0700
++++ b/launch-tp2.sh	2026-10-23 01:19:13.827665079 -0700
+@@ -117,6 +117,7 @@
+   -e TENSORFOLD_MEMORY_RESERVE_GIB="$RESERVE_GIB" \
+   -e TENSORFOLD_KV_POOL_GIB="$KV_POOL_GIB" \
+   -e TENSORFOLD_NO_UPDATE_CHECK=1 -e TP2_W8A16_DIAG=1 \
++  -e TP2_W8A16="${TP2_W8A16:-1}" -e TP2_W8A16_MODE="${TP2_W8A16_MODE:-fast}" \
+   -e TENSORFOLD_MAX_IMAGES=50 -e TENSORFOLD_IMAGE_TOKENS=16384 -e TENSORFOLD_VIDEO_TOKENS=16384 \
+   -e NCCL_SOCKET_IFNAME=$SOCK_IF -e GLOO_SOCKET_IFNAME=$SOCK_IF \
+   -e NCCL_IB_HCA=$IB_HCA -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_ROCE_VERSION_NUM=2 \

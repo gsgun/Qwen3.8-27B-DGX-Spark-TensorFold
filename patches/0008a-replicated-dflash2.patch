@@ -1,0 +1,247 @@
+# Patch 0008-A + 0008-D (TensorFold v0.6.0, 2026-10-24)
+# 0008-A: replicated rank-local DFlash2 — TP2_DRAFT_REPL=1 (default) forces
+#   the stock TP2 path: rank-0-only world=1 drafter (patches/tp2draftrepl.py),
+#   0 drafter NCCL collectives/round (was 12: 10 _row + 2 candidate gathers).
+#   TP2_DRAFT_REPL=0 restores the sharded joint drafter (boot-10 behavior).
+# 0008-D: --checkpoint-slots 32 in launch-tp2.sh (was default 12).
+# 0007 extension: tp2batchverify.py gains a full-NCCL-scope counter (hook 2b);
+#   gate now logs target-colls/round + draft-colls/round + dist-ag/round.
+# Rollback: restore .bak-pre-0008-1024 copies, or TP2_DRAFT_REPL=0 + no slots flag.
+
+diff -u patches/tp2batchverify.py.bak-pre-0008-1024 patches/tp2batchverify.py
+--- a/patches/tp2batchverify.py	2026-10-23 22:07:00.920464636 -0700
++++ patches/tp2batchverify.py	2026-10-23 22:07:00.924207928 -0700
+@@ -36,6 +36,15 @@
+   TP2_BATCH_VERIFY=1 + DIAG=2  - continuous watch: logs every 50 rounds,
+                                  never unhooked (pre-change DIAG=1 behavior).
+ 
++0008-A extension (2026-10-24): full-NCCL-scope counter (hook 2b).
++  gather_rank_partials misses the direct dist calls — dflash2.py:537-538
++  (candidate values/ids merge) and decode_tp._sample_split (split-head
++  halves). Hook 2b counts all_gather_into_tensor / all_gather / all_reduce
++  with the same in_fwd scoping, so the gate reports
++  target-colls/round=128.0 AND draft-colls/round (0.0 under
++  TP2_DRAFT_REPL=1; ~12/round under the stock sharded joint drafter) plus
++  dist-ag/round (total NCCL: 128 target + ~2 split-sampling expected).
++
+ Delivery: /patches mount is on PYTHONPATH ahead of dist-packages; the
+ shadow tensorfold/__init__.py installs this module at import time. No
+ behavior change, no image rebuild, persists across container recreation.
+@@ -63,6 +72,7 @@
+     st = {
+         "rounds": 0, "streams": 0, "rows": 0,
+         "forwards": 0, "colls": 0, "target_colls": 0,
++        "dist_colls": 0, "dist_target": 0,
+         "fwd_since_log": 0, "tcolls_since_log": 0,
+         "unhooked": False, "gate_done": False,
+     }
+@@ -100,6 +110,28 @@
+ 
+     _dist.gather_rank_partials = _counted_gather
+ 
++    # Hook 2b (0008-A): full-NCCL scope — the direct dist calls that
++    # gather_rank_partials misses (dflash2.py:537-538 candidate merge,
++    # decode_tp._sample_split split-head halves). Same in_fwd scoping.
++    import torch.distributed as _tdist
++
++    dist_orig = {}
++    for _name in ("all_gather_into_tensor", "all_gather", "all_reduce"):
++        _fn = getattr(_tdist, _name, None)
++        if _fn is None:
++            continue
++        dist_orig[_name] = _fn
++
++        def _make(_orig):
++            def _wrapped(*args, **kwargs):
++                st["dist_colls"] += 1
++                if in_fwd["n"] > 0:
++                    st["dist_target"] += 1
++                return _orig(*args, **kwargs)
++            return _wrapped
++
++        setattr(_tdist, _name, _make(_fn))
++
+     # Hook 3: round boundary (one _verify per decode round, both ranks).
+     orig_verify = _multi.MultiDecoder._verify
+ 
+@@ -119,18 +151,23 @@
+         per_round = st["fwd_since_log"] / float(GATE_ROUNDS)
+         tcolls_per = st["tcolls_since_log"] / float(GATE_ROUNDS)
+         total_per = st["colls"] / float(st["rounds"])
++        dist_per = st["dist_colls"] / float(st["rounds"])
++        dist_target_per = st["dist_target"] / float(st["rounds"])
+         ok = per_round == 1.0 and abs(tcolls_per - TARGET_COLLS) < 0.5
+         if ok:
+             sys.stderr.write(
+                 f"tp2batchverify: rounds={st['rounds']} streams={st['streams']} "
+                 f"rows={st['rows']} fwd/round={per_round:.2f} "
+                 f"target-colls/round={tcolls_per:.1f} (expect 128.0) OK "
+-                f"total-colls/round={total_per:.1f} (non-target {total_per - TARGET_COLLS:.1f} "
+-                f"= DFlash2 drafter) — 50-round invariant verified — "
+-                f"auto-unhooking hot-path wrappers\n")
++                f"draft-colls/round={total_per - tcolls_per:.1f} "
++                f"dist-ag/round={dist_per:.1f} (target {dist_target_per:.1f}, "
++                f"non-target {dist_per - dist_target_per:.1f}) — "
++                f"50-round invariant verified — auto-unhooking hot-path wrappers\n")
+             sys.stderr.flush()
+             _multi.multi_tree_forward = orig_forward
+             _dist.gather_rank_partials = orig_gather
++            for _name, _fn in dist_orig.items():
++                setattr(_tdist, _name, _fn)
+             _multi.MultiDecoder._verify = orig_verify
+             st["unhooked"] = True
+         else:
+@@ -146,6 +183,8 @@
+             # discard boot-time calibration forwards before counting
+             st["fwd_since_log"] = 0
+             st["tcolls_since_log"] = 0
++            st["dist_colls"] = 0
++            st["dist_target"] = 0
+         result = orig_verify(self, plan, copied)
+         st["rounds"] += 1
+         st["streams"] += len(plan)
+diff -u patches/tensorfold_init.py.bak-pre-0008-1024 patches/tensorfold_init.py
+--- a/patches/tensorfold_init.py	2026-10-23 22:07:00.921166981 -0700
++++ patches/tensorfold_init.py	2026-10-23 22:07:00.925035792 -0700
+@@ -34,6 +34,18 @@
+         _sys.stderr.write(f"tp2batchverify: install failed: {_e!r}\n")
+         _sys.stderr.flush()
+ 
++# 0008-A: replicated rank-local DFlash2 (0 draft NCCL collectives).
++# TP2_DRAFT_REPL=1 (default) forces the stock TP2 path: rank-0-only world=1
++# drafter; =0 restores the sharded joint drafter (boot-10 behavior).
++if _os.environ.get("TP2_DRAFT_REPL", "1") != "0":
++    try:
++        from tp2draftrepl import install as _install08a
++
++        _install08a()
++    except Exception as _e:  # an optional patch must never break the server
++        _sys.stderr.write(f"tp2draftrepl: install failed: {_e!r}\n")
++        _sys.stderr.flush()
++
+ if int(_os.environ.get("TF_PROF_ROUNDS", "0") or 0) > 0:
+     try:
+         from tfprof import install as _install_prof
+diff -u patches/tensorfold/__init__.py.bak-pre-0008-1024 patches/tensorfold/__init__.py
+--- a/patches/tensorfold/__init__.py	2026-10-23 22:07:00.922382985 -0700
++++ patches/tensorfold/__init__.py	2026-10-23 22:07:00.926257124 -0700
+@@ -34,6 +34,18 @@
+         _sys.stderr.write(f"tp2batchverify: install failed: {_e!r}\n")
+         _sys.stderr.flush()
+ 
++# 0008-A: replicated rank-local DFlash2 (0 draft NCCL collectives).
++# TP2_DRAFT_REPL=1 (default) forces the stock TP2 path: rank-0-only world=1
++# drafter; =0 restores the sharded joint drafter (boot-10 behavior).
++if _os.environ.get("TP2_DRAFT_REPL", "1") != "0":
++    try:
++        from tp2draftrepl import install as _install08a
++
++        _install08a()
++    except Exception as _e:  # an optional patch must never break the server
++        _sys.stderr.write(f"tp2draftrepl: install failed: {_e!r}\n")
++        _sys.stderr.flush()
++
+ if int(_os.environ.get("TF_PROF_ROUNDS", "0") or 0) > 0:
+     try:
+         from tfprof import install as _install_prof
+diff -u launch-tp2.sh.bak-pre-0008-1024 launch-tp2.sh
+--- a/launch-tp2.sh	2026-10-23 22:07:00.919484325 -0700
++++ launch-tp2.sh	2026-10-23 22:08:18.527214139 -0700
+@@ -83,6 +83,12 @@
+ YARN_FACTOR="${YARN_FACTOR:-}"
+ # Phase-2 timing probe (0 = off): capture N decode rounds, auto-unhook.
+ TF_PROF_ROUNDS="${TF_PROF_ROUNDS:-0}"
++# 0008-A (2026-10-24): replicated rank-local DFlash2 — TP2_DRAFT_REPL=1 (default)
++# forces the stock TP2 path: rank-0-only world=1 drafter (patches/tp2draftrepl.py),
++# 0 drafter NCCL collectives/round (was 12: 10 _row + 2 candidate gathers).
++# TP2_DRAFT_REPL=0 restores the sharded joint drafter (boot-10 behavior).
++# 0008-D: --checkpoint-slots 32 (default 12 = 3/lane) — 32 GDN/KV prefix entries
++# in the 16 GiB budget: ~10+ concurrent multi-turn agents, no LRU eviction at 4-5.
+ HF_CACHE=$HOME/.cache/huggingface
+ KERNEL_CACHE=$HOME/.cache/tensorfold-qwen38-27b
+ PATCH_DIR=$HOME/qwen38-tf-cluster/patches
+@@ -141,6 +147,7 @@
+   -e TENSORFOLD_NO_UPDATE_CHECK=1 -e TP2_W8A16_DIAG="${TP2_W8A16_DIAG:-0}" \
+   -e TP2_W8A16="${TP2_W8A16:-1}" -e TP2_W8A16_MODE="${TP2_W8A16_MODE:-fast}" \
+   -e TP2_BATCH_VERIFY="${TP2_BATCH_VERIFY:-1}" -e TP2_BATCH_VERIFY_DIAG="${TP2_BATCH_VERIFY_DIAG:-1}" \
++  -e TP2_DRAFT_REPL="${TP2_DRAFT_REPL:-1}" \
+   -e TF_PROF_ROUNDS="$TF_PROF_ROUNDS" \
+   -e TF_PROF_KERNELS="${TF_PROF_KERNELS:-0}" \
+   -e TENSORFOLD_YARN_FACTOR="$YARN_FACTOR" \
+@@ -167,6 +174,7 @@
+   "$IMAGE" \
+   numactl --cpunodebind=0 --membind=0 tensorfold serve "$MODEL" --tp 2 --master "$MASTER" "${RANKARGS[@]}" \
+     --parallel "$PAR" --context "$CTX" --prompt-cache-gib 16 --no-prefill-fp8 \
++    --checkpoint-slots 32 \
+     --thinking --temperature 1.0 --top-p 0.95 --top-k 20 "${DRAFT_FLAGS[@]}"   # --vision dropped (text/code/agent traffic only)
+ 
+ echo "launched $NAME ($(date +%T)) ctx=$CTX par=$PAR reserve=${RESERVE_GIB}GiB kvpool=${KV_POOL_GIB}GiB(yarn=${YARN_FACTOR:-native}) drafts=${DRAFTS_ON}"
+new file: patches/tp2draftrepl.py (see staged file; full source below)
+----- 8< -----
+"""Patch 0008-A (TensorFold v0.6.0): replicated rank-local DFlash2 — zero draft NCCL.
+
+Audit (2026-10-24, read-only): the qwen3_5 factory (families/qwen3_5/__init__.py:325)
+hard-codes tp_draft=tp==2, so at TP=2 BOTH ranks hold a sharded half of the DFlash2
+drafter and draft together:
+    - DFlash2._row (dflash2.py:476-483)   10 gather_rank_partials/round
+      (o_proj + mlp.down_proj across the 5 drafter layers)
+    - launch_blocks (dflash2.py:536-544)   2 all_gather_into_tensor/round
+      (candidate values + global ids, [rows, 16])
+    => 12 drafter collectives/round on the RoCE link (measured 149.7 all_gather
+       kernels/round = 128 target + 12 draft + 2 split-sampling + NCCL drift).
+
+Every DFlash2 code path is already world==1-native:
+    - __init__ (185-298): world==1 => no q/k/v/o/gate/up/down split,
+      heads_local=32, kv_local=8, sub_head a zero-copy row view of the target's
+      tiled head (matmul_rows at launch)
+    - _row (474-483):           world==1 => local matmul
+    - _layer_fast (447-483):    local given _row is local
+    - launch_blocks (489-534):  the candidate-gather pair is gated on world==2;
+      world==1 runs topk(k=16) locally over the full 98592-wide candidate logits
+    - add_taps / _commit:       local projections, no world gating
+The merged global top-16 of candidates is mathematically identical to the
+sharded merge (each rank's half top-16 covers its half of the global top-16;
+the union contains the global top-16, and topk picks the same 16).
+
+TP2_DRAFT_REPL=1 (default): force tp_draft=False at engine construction =>
+the stock TensorFold TP2 shape: the drafter exists ONLY on rank 0 as a
+world=1 full replica; rank 1 mirrors rank 0's windows (multi.py:98
+self.drafts is False there, so it never runs the drafter). Zero NCCL
+collectives in the draft pass. Rank 0 pays +1.8 GiB (full drafter vs the
+sharded half); rank 1 frees 1.8 GiB.
+TP2_DRAFT_REPL=0: no-op => stock sharded joint drafter (boot-10 behavior).
+
+Why safe: rank-0-only world=1 drafter is TensorFold's default TP2 path
+(engine.py:154-158 else branch); the joint sharded drafter is the opt-in
+deviation the family factory made. No dflash2.py / multi.py / engine.py line
+is edited — only the tp_draft kwarg is intercepted at Qwen27Engine.__init__.
+
+Phase-2 synergy: launch_blocks (Graph D) captured under this mode contains
+zero NCCL collectives => a pure local single-GPU CUDA graph capture.
+"""
+
+import os
+import sys
+
+
+def install():
+    if os.environ.get("TP2_DRAFT_REPL", "1") != "1":
+        sys.stderr.write("tp2draftrepl: off (TP2_DRAFT_REPL=0) — stock sharded joint DFlash2\n")
+        sys.stderr.flush()
+        return
+
+    from tensorfold.families.qwen3_5.cuda import engine as _engine
+
+    orig_init = _engine.Qwen27Engine.__init__
+
+    def _counted_init(self, *args, **kwargs):
+        if kwargs.get("tp_draft"):
+            kwargs["tp_draft"] = False
+            sys.stderr.write(
+                f"tp2draftrepl: rank {kwargs.get('rank', '?')} tp_draft True->False — "
+                f"rank-0 world=1 replicated DFlash2, 0 draft NCCL collectives\n")
+            sys.stderr.flush()
+        return orig_init(self, *args, **kwargs)
+
+    _engine.Qwen27Engine.__init__ = _counted_init
+----- >8 -----

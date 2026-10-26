@@ -66,6 +66,39 @@ sparkDash, so the decode figures are lower and not comparable one to one): per r
 2 / 4 / 8 clients; prefill 1,862 tok/s at 8k, 1,663 at 31k, 1,147 at 126k. `PARALLEL=16` reached 207 tok/s at 16
 clients. A single request decodes the same at every `PARALLEL`.
 
+
+## 8-Bit Dual-Node TP2 Variant (c1)
+
+The 8-bit checkpoint ([`TensorFold/Qwen3.8-27B-MLX-8bit`](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-8bit), ~30 GB, W8A16 affine, groups of 64) runs on a **two-node TP2** cluster (spark1 + spark2, ConnectX-7 RoCEv2 200 Gbps, MTU 9000) with 4 concurrent streams and 262,144-token context.
+
+Patches `0006`–`0008a` add the W8A16 affine dequantization path, TP2 multi-stream batch verification, and replicated DFlash2 drafter. The `w8a16_cuda/` directory contains a **native CUDA C++ extension** (`mma.sync m16n8k16 bf16`, `sm_121`) that replaces the Triton W8A16 GEMV/GEMM hot path for `bits==8 && gs==64`.
+
+**Decode** (tok/s, thinking off, draft on, fixed-seed benchmark)
+
+| Leg | Description | Native CUDA | v10e Triton | 4-bit MLX ref |
+| --- | --- | ---: | ---: | ---: |
+| p1d | prose, n=1 | 45.5 | 45.4 | 55.4 |
+| **c1d** | **code, n=1** | **100.9** | 94.1 | **88.0** |
+| p4d | prose, n=4 | 119.7 | 121.5 | 137.8 |
+| **c4d** | **code, n=4** | **227.3** | 208.0 | 268.8 |
+| m4d | mixed, n=4 | 127.0 | 125.3 | — |
+| c4off | code, n=4, no draft | 38.8 | 38.6 | — |
+
+**Prefill** (tok/s, unique prompts, BF16 prompt activations)
+
+| Prompt | Tokens | Native CUDA | v10e Triton | 4-bit MLX ref |
+| ---: | ---: | ---: | ---: | ---: |
+| 8k | 6,572 | 407 | 372 | 2,049 |
+| 16k | 13,126 | 344 | 274 | — |
+| 32k | 26,233 | 306 | 274 | — |
+| 64k | 52,447 | 283 | 270 | — |
+
+The 5× prefill gap vs 4-bit is structural: 2× weight bandwidth (8-bit vs 4-bit) × 2× activation precision (BF16 vs FP8 prompt kernels) × ~1.25× TP2 all-reduce amplification. The `--prefill-fp8` flag is gated to checkpoints with FP8 prompt kernels (the 4-bit MLX format has them; the 8-bit MLX format does not). A W8-to-FP8 `torch._scaled_mm` prefill bridge is parked as a future enhancement.
+
+**Warm multi-turn agent TTFT:** 102–340 ms across 32 checkpoint slots (in-memory GDN+KV prefix cache).
+
+**Parity:** 14/14 byte-exact (C=4, 2 reference SHAs). **0007 gate:** target-colls/round = 128.0, draft-colls/round = 0.0.
+
 ## Pinned KV pool
 
 `KV_POOL_GB` (patch 0005, default `auto`) reserves **up to 78 GiB of attention cache at startup**, 2,555,904 tokens at
@@ -324,3 +357,44 @@ by Qwen, [Vontra's MLX 4-bit checkpoint](https://huggingface.co/Vontra/Qwen3.8-2
 [z-lab's DFlash2 drafter](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), with the launcher, tools and the video code
 adapted from MiaAI-Lab's Flash Next recipe. The full list, including the YaRN source, the runtime stack and licenses,
 is in [`CREDITS.md`](CREDITS.md).
+
+## W8A16 CUDA extension + hybrid routing (TP=2, 8-bit affine checkpoint)
+
+Supports the [`TensorFold/Qwen3.8-27B-MLX-8bit`](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-8bit)
+affine W8A16 checkpoint (groups of 64) with a custom `mma.sync` bf16 GEMM
+(`patches/w8a16_cuda/`, sm_121) and a linear-dispatch hook
+(`patches/tp2w8a16.py`, installed via `sitecustomize.py`).
+
+### Hybrid routing (sealed resident config, boot79, 2026-10-26)
+
+| M (rows)            | Path                                              | Measured            |
+|---------------------|---------------------------------------------------|---------------------|
+| `M >= 512` (prefill)| Mode A: `dequant_to_bf16` + cuBLASLt bf16 GEMM    | 1406-1541 tok/s 8K-64K (3.8x Triton) |
+| `M < 512` (decode)  | v10e Triton `w8a16_mm_fast` (engine native)       | c1d 94.0 / c4d 196.1 / p1d 45.4 / p4d 111.4 tok/s |
+
+- `TP2_W8A16=1` (default on) activates the hook; `TP2_W8A16_MODE=fast` selects
+  `w8a16_mm_fast` for the Triton fallback.
+- `TP2_PREFILL_THRESH` (default 512) is the routing split; `prefill_mode.txt`
+  (`a`/`b`/`none`) selects the prefill accelerator.
+- `TP2_W8A16_DECODE=1` (default `0`) rolls decode back to the native CUDA
+  kernel (`b8440d18`, c1d 87.2 / c4d 186.0 tok/s).
+- Deploy rule: the extension `.so` must sit at the **`/patches/` volume root**
+  (container `PYTHONPATH=/patches`), not only in `patches/w8a16_cuda/`.
+
+### Versioned hashes
+
+| Artifact                                  | md5 / sha   |
+|-------------------------------------------|-------------|
+| `patches/w8a16_cuda/w8a16_cuda_qmm.so.b8440d18` (drain, resident) | `b8440d18c2f473a9829088970cb13f43` |
+| `patches/tp2w8a16.py` (hybrid dispatch)   | `e3f8d40cbe49f23ef97eac0c6e6d305f` |
+| `patches/w8a16_cuda/qmm_kernel_b8440d18.cu` (drain source) | see file |
+| `patches/w8a16_cuda/qmm_kernel_gen1_recovered.cu` (Gen-1 `3490ac1f` source, recovered from session transcripts) | `a6d6411640cebfad7affa312d054eca8` |
+| `patches/w8a16_cuda/w8a16_cuda_qmm.so.gen1-2f84` (Gen-1 17:53 rebuild, binary `3490ac1f` lost) | `2f841d3de90fe399985d62312c571eee` |
+
+Parity fingerprints (C=4, draft:True, temp 0): code prompt `39191bf72982`
+(canonical, stable across all builds); prose prompt build-sensitive
+(boot79 hybrid `9ae72b23bafa`, w78 `88ed89a747dc`, boot-10/v10e `d5589b366369`).
+
+Scorecards: `bench/hybrid_scorecard.txt` (boot79), `bench/native_cuda_scorecard.txt`
+(w78 vs v10e), `bench/v10e_scorecard.txt`. See `patches/w8a16_cuda/GEN1_RESCUE.md`
+for the forensic recovery record of the Gen-1 kernel.
