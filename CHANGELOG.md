@@ -21,3 +21,10 @@
 - **`.gitignore`**: `*.bak*`, `*.o`, `build/` added (local `.bak` files stay untracked on disk).
 - Live `boot79` containers untouched: health `ok:true` and `.so`/wrapper md5s re-verified on
   both ranks before and after the cleanup.
+
+## [boot80] - 2026-10-27
+### Added
+- Phase 1 (v11 target graph evaluation): Confirmed TP2_V11_GRAPH=0 winner (v10e 3ccfeb2b eager staging across S in 1..4, c4d 210.55 tok/s, 128.0 target collectives).
+- Phase 2 (FP8 prefill AllGather): Patch 0009 rowwise float8_e4m3fn all_gather for M >= 2048 with per-row bfloat16 scaling. Cuts RoCEv2 prefill wire payload ~50% (cosine_sim > 0.9996). 8K-64K prefill accelerated to 1566/1580/1573/1522 tok/s (+7.2% to +19.7% speedup). Zero-restart runtime toggle via /tmp/tp2_fp8_gather_on.
+- Phase 3 (Snapshots and NUMA): Mounted persistent snapshot spill storage (/var/tmp/tf-snapshots:/snapshots) with --snapshot-dir /snapshots alongside --checkpoint-slots 32 --prompt-cache-gib 16. NUMA node 0 memory and CPU binding (numactl --cpunodebind=0 --membind=0).
+- Phase 4 (Verification battery): Verified 128.0 target collectives/round, 0.0 draft collectives, det500 byte-exact (550 tokens), and 8/8 cross-stream parity (prose 9ae72b23bafa x 4, code 39191bf72982 x 4).

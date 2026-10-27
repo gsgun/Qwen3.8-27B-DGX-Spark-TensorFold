@@ -155,6 +155,8 @@ docker run -d --name "$NAME" \
   -e TP2_BATCH_VERIFY="${TP2_BATCH_VERIFY:-1}" -e TP2_BATCH_VERIFY_DIAG="${TP2_BATCH_VERIFY_DIAG:-1}" \
   -e TP2_DRAFT_REPL="${TP2_DRAFT_REPL:-1}" \
   -e TP2_CUDA_GRAPHS="${TP2_CUDA_GRAPHS:-1}" \
+  -e TP2_V11_GRAPH="${TP2_V11_GRAPH:-0}" -e TP2_V11_TARGET_GRAPH="${TP2_V11_TARGET_GRAPH:-0}" \
+  -e TP2_PREFILL_FP8_GATHER="${TP2_PREFILL_FP8_GATHER:-0}" \
   -e TP2_GRAPH_D="${TP2_GRAPH_D:-0}" \
   -e TF_SLOT_KV_CAP="$TF_SLOT_KV_CAP" \
   -e TF_PROF_ROUNDS="$TF_PROF_ROUNDS" \
@@ -166,7 +168,7 @@ docker run -d --name "$NAME" \
   -e NCCL_SOCKET_IFNAME=$SOCK_IF -e GLOO_SOCKET_IFNAME=$SOCK_IF \
   -e NCCL_IB_HCA=$IB_HCA -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_ROCE_VERSION_NUM=2 \
   -e NCCL_IB_DISABLE=0 -e NCCL_IB_MERGE_NICS=0 -e NCCL_CROSS_NIC=0 \
-  -e NCCL_BUFFSIZE=8388608 \
+  -e NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-33554432}" \
   -e NCCL_NET_PLUGIN=none -e NCCL_NET=IB \
   -e NCCL_NVLS_ENABLE=0 -e NCCL_CUMEM_ENABLE=0 -e NCCL_MULTI_RANK_GPU_ENABLE=1 \
   -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
@@ -182,10 +184,11 @@ docker run -d --name "$NAME" \
   -v "$HF_CACHE":/root/.cache/huggingface \
   -v "$KERNEL_CACHE":/cache \
   -v "$HOME/qwen38-tf-cluster/probe_out":/probe_out \
+  -v /var/tmp/tf-snapshots:/snapshots \
   "$IMAGE" \
   numactl --cpunodebind=0 --membind=0 tensorfold serve "$MODEL" --tp 2 --master "$MASTER" "${RANKARGS[@]}" \
     --parallel "$PAR" --context "$CTX" --prompt-cache-gib 16 --no-prefill-fp8 \
-    --checkpoint-slots 32 \
+    --checkpoint-slots 32 --snapshot-dir /snapshots \
     --thinking --temperature 1.0 --top-p 0.95 --top-k 20 "${DRAFT_FLAGS[@]}"   # --vision dropped (text/code/agent traffic only)
 
 echo "launched $NAME ($(date +%T)) ctx=$CTX par=$PAR reserve=${RESERVE_GIB}GiB kvpool=${KV_POOL_GIB}GiB(yarn=${YARN_FACTOR:-native}) drafts=${DRAFTS_ON}"

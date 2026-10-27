@@ -260,3 +260,32 @@ CUDA extension, the replicated-drafter and checkpoint-slot patches, and every nu
 `boot79`/`w78`/`v10e` columns are this repository's. `TensorFold/Qwen3.8-27B-MLX-8bit` and
 `z-lab/Qwen3.8-27B-DFlash2` checkpoints © their respective authors. See `CREDITS.md` and
 `LICENSE` (MIT).
+
+## boot80 Production Verification Scorecard (Dual DGX Spark GB10 · 8-Bit TP=2)
+
+Deployed and resident at :8894 across spark1 (rank 0) + spark2 (rank 1).
+
+### Prefill Throughput (Phase 2 FP8 Gather 0009 vs Mode A Baseline)
+| Context Length | Stock Mode A (tok/s) | FP8 Gather 0009 (tok/s) | Speedup |
+| :--- | :--- | :--- | :--- |
+| **8K** | 1308.4 | **1565.9** | **+19.7%** |
+| **16K** | 1461.7 | **1579.9** | **+8.1%** |
+| **32K** | 1466.6 | **1572.9** | **+7.2%** |
+| **64K** | 1416.6 | **1522.0** | **+7.4%** |
+
+### Decode and Multi-Stream Scaling (Phase 1 v10e Eager Staging)
+| Metric | Baseline | boot80 Score | Status |
+| :--- | :--- | :--- | :--- |
+| **c1d (Code, C=1, DFlash2)** | 94.0 tok/s | **93.46 tok/s** | Verified |
+| **p1d (Prose, C=1, DFlash2)** | 45.4 tok/s | **48.44 tok/s** | +6.7% |
+| **c4d (Code, C=4, DFlash2)** | 196.1 tok/s | **210.55 tok/s** | **+7.3%** |
+| **p4d (Prose, C=4, DFlash2)** | 111.4 tok/s | **123.60 tok/s** | **+10.9%** |
+| **m4d (Mixed, C=4, DFlash2)** | 111.5 tok/s | **126.36 tok/s** | **+13.4%** |
+| **c4off (Drafter Off, C=4)** | 37.5 tok/s | **38.60 tok/s** | Verified |
+
+### Reliability and Verification Battery
+- **Target Collectives:** 128.0 / round (2 x 64 layers, zero collective leakage)
+- **Draft Collectives:** 0.0 / round (replicated rank-local DFlash2)
+- **det500:** BYTE_EXACT PASS (2 x 550 tokens, SHA256 079bd6d2f3c557d1)
+- **C=4 Cross-Stream Parity:** 8/8 PASS (Prose 9ae72b23bafa x 4, Code 39191bf72982 x 4)
+- **Snapshot Persistence:** --snapshot-dir /snapshots mapped to /var/tmp/tf-snapshots
