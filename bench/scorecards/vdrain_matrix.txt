@@ -1,0 +1,25 @@
+vdrain determinism matrix — b8440d18 (cp_wait<0>() L134 K-loop drain + dequant_to_bf16)
+=====================================================================================
+Measured 2026-10-25/26 on spark1 rank0 (qwen38-tf-rank0, v0.6.0-idlebell), probe kernel
+w8a16_cuda_qmm.cpython-312-aarch64-linux-gnu.so @ /patches/ root.
+
+1) Call-to-call flips, 50 L2-flushed calls per config (0 = deterministic):
+   M=1 (bf16 in)   flips: 0
+   M=1 (f32  in)   flips: 0
+   M=17            flips: 0
+   M=1024          flips: 0
+   Result: 0 / 0 / 0 / 0
+
+2) compute-sanitizer (memory + init check, full probe sweep): 0 errors
+
+3) rel_err vs FP64 reference (per-M max, dequant_to_bf16 + mma.sync bf16 path):
+   0.189% - 0.270%
+
+4) RoCE L2-flush divergence matrix (8K/16K/32K/64K prefill, flush on vs off):
+   0 / 0 / 0 / 0  identical token streams, 0 dropped packets
+   -> RoCE link clean under GEMM load; drain fix numerically inert
+      (cp_wait gates readiness only, not accumulation order).
+
+Conclusion: b8440d18 is numerically inert vs Gen-1 3490ac1f on decode
+(cp_wait serialization cost ~7-11 tok/s at C=4) and is kept RESIDENT for
+Mode A prefill (dequant_to_bf16 + cuBLASLt, 1406-1541 tok/s 8K-64K).

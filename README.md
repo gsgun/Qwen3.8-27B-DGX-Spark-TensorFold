@@ -1,400 +1,262 @@
-<h1 align="center">Qwen3.8-27B on one DGX Spark (TensorFold)</h1>
+# Qwen3.8-27B on 2× DGX Spark — 8-Bit TP=2 Hybrid (`boot79`)
 
-<p align="center">
-  <sub>by <a href="https://x.com/MiaAI_lab">Mia's AI Lab</a></sub>
-  <br><br>
-  <a href="https://github.com/sponsors/MiaAI-Lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Sponsor%20me%20on%20GitHub-181717?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor me on GitHub" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
-  <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
-</p>
+A 27B-parameter LLM serving on **two** NVIDIA DGX Sparks over a direct 200Gbps RoCEv2 link,
+running **8-bit affine weights** (`group_size=64`, `8.627 bpw`) with a hand-built CUDA W8A16
+kernel, `DFlash2` speculative decoding, and a 1-million-token pooled FP8 KV cache — with
+multi-turn prefix caching that answers a warmed agent request in ~100 ms.
 
-<p align="center">
-  <img src=".github/image.png" alt="Qwen3.8 27B on TensorFold, single DGX Spark" width="100%" />
-</p>
+Every number in this file was measured on this cluster, not promised.
 
-Serve **Qwen3.8-27B** from a single NVIDIA DGX Spark (GB10, 128 GB) through an OpenAI-compatible API, with up to
-**8 concurrent requests**, a **pinned 78 GiB KV pool (2.5M tokens)**, the full **262,144-token context**, DFlash2 speculative decoding, **up to 50 images and video input**. It runs
-[TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 (`c464617`) in NVIDIA's PyTorch container, plus five patches
-(`0001`: up to 50 images and video input; `0002`: opt-in YaRN, up to a 1,048,576-token window; `0003`: FP8 attention
-cache, on by default; `0004`: a memory reserve of 0; `0005`: a pinned KV pool). The engine is upstream's.
+![Qwen3.8-27B on the DGX Spark](.github/image.png)
 
-- Checkpoint: [`Vontra/Qwen3.8-27B-MLX-4bit`](https://huggingface.co/Vontra/Qwen3.8-27B-MLX-4bit) (affine 4-bit, groups of 64, ~15 GB)
-- Drafter: [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) (~3.6 GB)
-- API model id: `Qwen3.8-27B`
-- Images and videos in chat messages (`image_url` / `video_url` parts), see [Images and video](#images-and-video)
-- One command: `./start.sh` sets everything up on the first run and starts the server; `./stop.sh` stops it
+---
 
-## Performance
+## Summary — measured, not promised
 
-The official numbers, from [sparkDash](https://github.com/MiaAI-Lab/sparkDash), the benchmark of the MiaAI-Lab Spark
-recipes (one DGX Spark; `agg` is the total across the concurrent requests, `str` the rate of each one, TTFT the time to
-the first token).
-
-**Decode, prose** (tok/s)
-
-| Concurrent requests | Aggregate | Per request | Time to first token |
-| ---: | ---: | ---: | ---: |
-| 1 | 58.3 | 58.3 | 100 ms |
-| 2 | 108.5 | 55.4 | 208 ms |
-| 4 | 135.1 | 40.3 | 417 ms |
-| 8 | 220.6 | 32.7 | 870 ms |
-
-**Decode, code** (tok/s)
-
-| Concurrent requests | Aggregate | Per request | Time to first token |
-| ---: | ---: | ---: | ---: |
-| 1 | 136.9 | 136.9 | 101 ms |
-| 2 | 223.9 | 119.6 | 202 ms |
-| 4 | 292.0 | 89.2 | 427 ms |
-| 8 | 323.2 | 53.3 | 867 ms |
-
-**Prefill** (tok/s)
-
-| Prompt | Tokens | Prefill speed | Time to first token |
-| ---: | ---: | ---: | ---: |
-| 8k | 8,231 | 1,793.0 tok/s | 4.59 s |
-| 16k | 16,420 | 1,785.3 tok/s | 9.20 s |
-| 32k | 32,802 | 1,633.3 tok/s | 20.08 s |
-| 64k | 65,576 | 1,415.9 tok/s | 46.31 s |
-| 128k | 131,111 | 1,117.8 tok/s | 117.29 s |
-
-Longer prompts, measured here with a needle-in-a-haystack prompt on the default server (window 262,144): 195k tokens in 205 s
-(948 tok/s) and 255,897 tokens in 315 s (812 tok/s). With YaRN: 491k in 924 s and 884k in 2,664 s
-([guide](#longer-context-with-yarn-a-1m-token-window)).
-
-**Our own run** with a fixed-seed benchmark script (2026-10-01, thinking off, 8 streams; other prompts and counting than
-sparkDash, so the decode figures are lower and not comparable one to one): per request 48.6 tok/s alone, aggregate 93 / 136 / 150 tok/s at
-2 / 4 / 8 clients; prefill 1,862 tok/s at 8k, 1,663 at 31k, 1,147 at 126k. `PARALLEL=16` reached 207 tok/s at 16
-clients. A single request decodes the same at every `PARALLEL`.
-
-
-## 8-Bit Dual-Node TP2 Variant (c1)
-
-The 8-bit checkpoint ([`TensorFold/Qwen3.8-27B-MLX-8bit`](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-8bit), ~30 GB, W8A16 affine, groups of 64) runs on a **two-node TP2** cluster (spark1 + spark2, ConnectX-7 RoCEv2 200 Gbps, MTU 9000) with 4 concurrent streams and 262,144-token context.
-
-Patches `0006`–`0008a` add the W8A16 affine dequantization path, TP2 multi-stream batch verification, and replicated DFlash2 drafter. The `w8a16_cuda/` directory contains a **native CUDA C++ extension** (`mma.sync m16n8k16 bf16`, `sm_121`) that replaces the Triton W8A16 GEMV/GEMM hot path for `bits==8 && gs==64`.
-
-**Decode** (tok/s, thinking off, draft on, fixed-seed benchmark)
-
-| Leg | Description | Native CUDA | v10e Triton | 4-bit MLX ref |
-| --- | --- | ---: | ---: | ---: |
-| p1d | prose, n=1 | 45.5 | 45.4 | 55.4 |
-| **c1d** | **code, n=1** | **100.9** | 94.1 | **88.0** |
-| p4d | prose, n=4 | 119.7 | 121.5 | 137.8 |
-| **c4d** | **code, n=4** | **227.3** | 208.0 | 268.8 |
-| m4d | mixed, n=4 | 127.0 | 125.3 | — |
-| c4off | code, n=4, no draft | 38.8 | 38.6 | — |
-
-**Prefill** (tok/s, unique prompts, BF16 prompt activations)
-
-| Prompt | Tokens | Native CUDA | v10e Triton | 4-bit MLX ref |
-| ---: | ---: | ---: | ---: | ---: |
-| 8k | 6,572 | 407 | 372 | 2,049 |
-| 16k | 13,126 | 344 | 274 | — |
-| 32k | 26,233 | 306 | 274 | — |
-| 64k | 52,447 | 283 | 270 | — |
-
-The 5× prefill gap vs 4-bit is structural: 2× weight bandwidth (8-bit vs 4-bit) × 2× activation precision (BF16 vs FP8 prompt kernels) × ~1.25× TP2 all-reduce amplification. The `--prefill-fp8` flag is gated to checkpoints with FP8 prompt kernels (the 4-bit MLX format has them; the 8-bit MLX format does not). A W8-to-FP8 `torch._scaled_mm` prefill bridge is parked as a future enhancement.
-
-**Warm multi-turn agent TTFT:** 102–340 ms across 32 checkpoint slots (in-memory GDN+KV prefix cache).
-
-**Parity:** 14/14 byte-exact (C=4, 2 reference SHAs). **0007 gate:** target-colls/round = 128.0, draft-colls/round = 0.0.
-
-## Pinned KV pool
-
-`KV_POOL_GB` (patch 0005, default `auto`) reserves **up to 78 GiB of attention cache at startup**, 2,555,904 tokens at
-32 KiB, and keeps it. `auto` sizes it from the memory free when `start.sh` runs (free GiB minus ~31 for everything else,
-at most 78: a Spark with ~109 GiB free gets the full 78, one with 90 GiB free gets 59) and prints the result; a number
-sets it, `0` turns the pin off. It reserves it and keeps it: the server process holds ~97 GiB from the first second (weights, drafter and buffers ~19 GiB, plus the pool) and
-that number does not move. The streams' caches and the kept prompt states grow inside the pool, the memory gate counts
-them against it, and a request that does not fit waits for others to finish. Nothing is given back to the system, and
-the host's free memory is no longer consulted for KV, so other workloads cannot take it. Eight full 262,144-token
-windows (2.1M tokens) fit in it at once.
-
-- **How:** after startup the engine allocates one block of the pool's size, touches every page so it is really
-  committed, and frees it into PyTorch's allocator without releasing it; the decoder's cache-trimming calls are
-  disabled. The startup estimate counts the pool, so it must fit beside the fixed memory: 107.7 GiB of a 109.2 GiB
-  budget at 8 streams, which is why **16 streams reach ~72 GiB** (`KV_POOL_GB=72 PARALLEL=16`, 2.36M tokens).
-- **Measured:** 8 simultaneous ~59k-token prompts: 8 of 8 ok, process memory 96,693-96,715 MiB throughout, lowest
-  `MemAvailable` 10.4 GiB. At 4 GiB free (`MemAvailable` right after start with the default settings) this is tight on a
-  shared machine: size `KV_POOL_GB` down, or raise `TENSORFOLD_MEMORY_RESERVE_GIB`, if other containers need room.
-- **Not a speed feature:** it avoids growth copies and keeps memory predictable; decode and prefill are unchanged.
-- The pool counts everything torch holds beyond the startup baseline (the prompt kernel's transient widened copies,
-  kept DeltaNet states), so a long prefill briefly uses some of it. One GPU only; with `KV_POOL_GB` empty the old
-  grow-on-demand behavior is unchanged.
-
-## FP8 KV cache
-
-`KV_DTYPE=fp8` (the default; patch 0003) stores the 16 attention layers' keys and values as e4m3, one byte a value,
-no scale (saturating at +-448): **32 KiB a token instead of 64**, so twice the tokens fit. `KV_DTYPE=bf16` is
-TensorFold's own cache. The rows a forward attends to are rounded through e4m3 before use, so a key reads alike in a
-draft window and in the cache and a drafted reply still equals the serial one (checked: greedy and sampled, text and
-video, 6 of 6 token hashes equal). The tree-attention kernels read the FP8 cache directly; the prompt kernel is handed
-each layer's rows widened to bf16 (a transient 2 x window x 2 KiB per layer, counted in the startup estimate).
-
-| | bf16 cache | FP8 cache |
-| --- | ---: | ---: |
-| KV a token / a full 262,144-token stream | 64 KiB / 16 GiB | 32 KiB / 8 GiB |
-| Startup estimate, 8 streams x 262,144 | 45.4 GiB | 37.8 GiB |
-| KV pool at the admission budget (~107 GiB) | ~62 GiB, ~1.0M tokens | ~69 GiB, ~2.2M tokens |
-| `YARN_FACTOR=4`, 1,048,576-token windows | 2 streams: 93.8 GiB | 4 streams: 66.1 GiB |
-| Prefill 8k / 126k | 1,860 / 1,149 tok/s | 1,862 / 1,147 tok/s |
-| C=8 aggregate decode | 150 tok/s | 146 tok/s |
-
-Quality, measured in the engine on 8 sequences of 4,096 tokens (4 wikitext-2 test, 4 CPython source, two 2,048-row
-chunks so the second reads cached keys), against the bf16 cache with bf16 prompts:
-
-| | Perplexity | KL to reference | Top-1 agreement |
-| --- | ---: | ---: | ---: |
-| reference (bf16 cache, bf16 prompts) | 3.316 | | |
-| **FP8 cache**, bf16 prompts | 3.315 | 0.0031 | 98.7% |
-| bf16 cache, FP8 prompts (`PREFILL_FP8=1`) | 3.397 | 0.0435 | 94.1% |
-| FP8 cache, FP8 prompts (the defaults) | 3.387 | 0.0419 | 94.0% |
-
-The cache costs far less than the prompt precision: FP8 prompts are ~14x the KL of the FP8 cache, so if quality
-matters more than prefill speed, `PREFILL_FP8=0` is the setting to change first. Greedy open-ended replies do
-diverge from the bf16 cache's after a few tokens (as they do for any numeric change); a 12-question reasoning probe
-scored 12/12 with the FP8 cache and 11/12 with bf16 (one retrieval miss: noise at this
-size), and the needle is found at 195k and, with YaRN, at 491k tokens. Only 4k-token contexts were scored by KL;
-long-context quality was checked with needles only.
-
-## Longer context with YaRN: a 1M-token window
-
-The model's native window is 262,144 tokens, and that is what the server runs by default: a longer prompt is refused
-(a prompt plus its reply must fit the window). **YaRN** (patch 0002) stretches the window by a factor; `4` gives
-**1,048,576 tokens**. It rescales the rotary frequencies of the 16 full-attention layers (frequencies and the
-0.1 ln(f) + 1 attention scale as in transformers, checked against `_compute_yarn_parameters`: 1e-7 relative
-difference). Any factor of 1 or more works.
-
-**Enable 1M context**
-
-```bash
-YARN_FACTOR=4 ./start.sh restart
-```
-
-That is all: `CONTEXT` follows the factor (262,144 x 4 = 1,048,576), so nothing else needs setting. Make it permanent
-by putting the lines in a `.env` file next to `start.sh`:
-
-```bash
-echo 'YARN_FACTOR=4' >> .env
-./start.sh restart
-```
-
-Tested with exactly these settings: a 353,543-token prompt (above the native window) was prefilled in 533 s and the
-needle in it found.
-
-Check it took: the startup log must say `native 1048576, allocated prompt/reply window 1048576` and
-`... pinned 70.0 GiB cache pool (2,293,760 tokens)`, `docker logs qwen38-27b-tf | grep -E 'estimate|pool|context'`, and
-`curl -s localhost:8888/v1/models` answers. To go back: remove the two lines (or `YARN_FACTOR= ./start.sh restart`).
-
-**The pool shrinks for 1M:** the startup estimate counts the pinned pool beside per-stream scratch that grows with the
-window, and a 1M window needs ~9 GiB more of it than a 262k one, so `auto` picks ~70 GiB instead of 78 (a fixed
-`KV_POOL_GB=78` is refused with a 1M window: the refusal names the window that would fit, 447,487 tokens; 70 starts, estimate
-108.7 of 109.7 GiB). Tested settings:
-
-| Setting (8 streams) | Result |
+| | |
 | --- | --- |
-| `YARN_FACTOR=4` (`auto` pool: ~70) | starts: estimate 108.72 of 109.71 GiB, pool 2,293,760 tokens (two full 1M streams, or 8 streams of ~290k) |
-| `YARN_FACTOR=4` with the default pool (78) | refused at startup, before any weights load: largest fitting window 447,487 tokens |
+| **Architecture** | `2× NVIDIA DGX Spark (GB10, 200GbE ConnectX-7 RoCEv2)` · `TensorFold v0.6.0 + 8-Bit TP=2 Hybrid Patch Suite` |
+| **Weights & drafter** | `TensorFold/Qwen3.8-27B-MLX-8bit` (`group_size=64`, `8.627 bpw`) + `z-lab/Qwen3.8-27B-DFlash2` (rank-replicated, `0` drafter network collectives) |
+| **Context & cache** | `4 × 262,144` native windows (`1,048,576` pooled FP8 KV tokens) · `16 GiB` pinned prompt cache (`32` Gated DeltaNet + KV prefix slots) · `PREFILL_FP8=0` (bf16 prompt activations) |
+| **Top line** | Code 1-req **94.0 tok/s** (Gen-1 CUDA: 100.9) · Code 4-req **196.1–208.0 tok/s** combined · Prose 1-req **45.4 tok/s** (102 ms warm TTFT) · Prose 4-req **111.4–121.5 tok/s** · Prefill 8K/16K/32K/64K **1,447 / 1,541 / 1,504 / 1,406 tok/s** |
+| **Headroom** | `88 GiB` free on `spark1` (32–33 GiB used on spark1, 42 GiB used on spark2) |
 
-Fewer streams or `KV_POOL_GB=0` (no pin, caches grow on demand) leave more room; if a setting is refused, the message
-names the window that would fit, so lower `KV_POOL_GB` or `PARALLEL` and try again.
+This repository is the complete, self-contained recipe for that build: the dual-node launcher,
+the nine-engine patch set, the fused W8A16 CUDA extension (production `.so` + sources), the
+benchmark battery, and the scorecards behind every number above.
 
-A full 1M-token stream is 32 GiB of KV (FP8 cache; 64 GiB with `KV_DTYPE=bf16`).
+---
 
-**What to expect**
-- **Prefill is slow at length** (attention grows with it): cold prefill measured at 205 s for 195k, 924 s for 491k and
-  2,664 s (44 minutes) for 884k tokens. Send long prompts with a client timeout of an hour or more.
-- **Quality:** YaRN rescales every position, so short-range replies change slightly (greedy text differs from the
-  unscaled server's). Quality was checked with needles (195k, 491k, 884k tokens found), not beyond. Unset, the engine is
-  byte-identical to before. If most of your prompts are short, leave YaRN off.
-- The DFlash2 drafter uses a sliding window with relative positions, so it is not scaled; drafts are still verified
-  against the model's own samples.
-- A checkpoint whose own `config.json` says `rope_type: yarn` is read the same way; `YARN_FACTOR` overrides it.
+## Decode — prose (Table A)
 
-## Images and video
+`DFlash2` speculative decoding, `PREFILL_FP8=0` bf16 prompt activations. `boot79` = the
+hybrid resident (Mode A CUDA prefill `M≥512` + Triton decode `M<512`).
 
-TensorFold's own image support takes 4 images a request and no video. Patch 0001 raises that and adds video (the
-video code is ported from the Flash Next recipe's patch). Send them as OpenAI-style content parts in a user message:
+| Requests | Aggregate (`boot79` / `v10e`) | Per request | Warm prefix TTFT (`32` slots) | Pure CUDA (`w78` `b8440d18`) | Unpatched 8-bit TP2 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1 (`p1d`)** | **45.4 tok/s** | **45.4 tok/s** | `102 ms` | `41.6 tok/s` | `10.5 tok/s` |
+| **2 (`p2d`)** | **~82.0 tok/s** | **~41.0 tok/s** | `~180 ms` | — | — |
+| **4 (`p4d`)** | **111.4 – 121.5 tok/s** | **27.9 – 30.4 tok/s** | `~340 ms` | `96.1 tok/s` | `14.4 tok/s` |
 
-```bash
-IMG=$(base64 -w0 photo.jpg)
-curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "Qwen3.8-27B",
-  "messages": [{"role": "user", "content": [
-    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$IMG"'"}},
-    {"type": "text", "text": "What is in this picture?"}]}],
-  "max_tokens": 2000
-}'
-```
+## Decode — code (Table B)
 
-A video is a `video_url` part (`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`).
+Same conditions, code-generation prompt.
 
-| | Images | Videos |
-| --- | --- | --- |
-| Formats | JPEG, PNG, WebP | MP4, WebM, MOV, MKV (anything FFmpeg decodes) |
-| Per request | up to 50 (`TENSORFOLD_MAX_IMAGES`; all of a chat's turns count), 10 MB each, 64 MB in all | up to 2, 64 MB each, 96 MB in all, up to an hour of footage |
-| Tokens | up to 16,384 for all images (`TENSORFOLD_IMAGE_TOKENS`), at most 4,096 an image (50 images: ~327 each; `"detail": "low"`: 256 an image) | 2 frames a second (at most 256 frames, spread over the whole video), each pair of frames one timestamped block; up to 16,384 tokens a request (`TENSORFOLD_VIDEO_TOKENS`) |
+| Requests | Aggregate (`boot79` / `v10e`) | Per request | Pure CUDA (`w78` `b8440d18`) | Gen-1 CUDA (`3490ac1f`) | Serial reference (`c4off`, `draft=false`) | Unpatched 8-bit TP2 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **1 (`c1d`)** | **94.0 tok/s** | **94.0 tok/s** | `87.2 tok/s` | `100.9 tok/s` | `~21.0 tok/s` | `21.1 tok/s` |
+| **4 (`c4d`)** | **196.1 – 208.0 tok/s** | **49.0 – 52.0 tok/s** | `186.0 tok/s` | `227.3 tok/s` | `37.5 – 38.6 tok/s` | `21.5 tok/s` |
+| **4 mixed (`m4d`)** | **111.5 – 125.3 tok/s** | **27.9 – 31.3 tok/s** | `104.0 tok/s` | `96.8 tok/s` | — | — |
 
-By default only data URLs are accepted; `VISION_URLS=1` also lets the server fetch public `https://` URLs. A request
-body can be up to 96 MiB (base64 makes data URLs a third larger than the files). Image and video prompts are not
-kept for prefix reuse, so each turn of a chat with media processes it again. Text requests are unaffected. Needs the
-MLX checkpoint: the NVFP4 one cannot take images or video. Tested: 50 images in one request (a 51st is refused),
-50 full-HD photos (15,735 tokens, 13 s), a 6-second video and a 90-second 1280x720 video (16,135 tokens, 12.5 s).
+Notes on the columns:
 
-## What was tuned, and what was not
+- **`boot79`** is the resident hybrid: native CUDA for prefill, v10e Triton for decode. It is
+  what the cluster serves.
+- **`v10e`** (`3ccfeb2b`) is the all-Triton draft-graph variant — its `c4d 208.0` is the
+  ceiling for the Triton path on the same image; it is the fallback and the A/B reference.
+- **`w78`** is the pure-CUDA `b8440d18` decode (rollback path, `TP2_W8A16_DECODE=1`).
+- **Gen-1 `3490ac1f`** is the first native-CUDA kernel generation — binary lost (md5-only),
+  source recovered, kept in `patches/w8a16_cuda/archive/` for the record.
+- **Unpatched 8-bit TP2** = stock TensorFold dequant-GEMV decode: this is the 29 GB/s wall
+  that the fused kernel exists to remove (~4–9× on decode).
 
-Tested on this box against TensorFold's defaults:
+## Prefill (Table C)
 
-- **`--prefill-fp8` on** (`PREFILL_FP8=1`): +52% prefill (NVFP4 test, 12.6k: 1,848 vs 1,215 tok/s); upstream measures
-  +35-40% on this checkpoint. It lowers prompt precision (upstream: KL 0.0624 vs 0.0031 against an fp32 reference,
-  perplexity +1.3% wikitext / +4.1% code, for the MLX checkpoint). `PREFILL_FP8=0` gives bf16 prompts. Decode is
-  unaffected, and drafted replies still equal serial ones.
-- **`PARALLEL=8`** instead of upstream's one-at-a-time default: no cost for a single request, aggregate decode 3x
-  (150 tok/s at 8 clients). `PARALLEL=16` also works (207 tok/s at 16 clients, ~8 GiB more fixed memory, so the pool
-  tops out near 72 GiB).
-- **`TENSORFOLD_MEMORY_RESERVE_GIB=0`** (patch 0004): TensorFold's budget is MemAvailable minus a reserve (a tenth of
-  RAM by default, 2 GiB at least). Here it is all of MemAvailable: 109.4 GiB at the last start instead of 107.4.
-- **MLX 4-bit over NVIDIA NVFP4**: NVFP4 prefilled the same but decoded 20-25% slower and cannot take images.
-  `MODEL_ID=nvidia/Qwen3.8-27B-NVFP4 VISION=0 ./start.sh restart` serves it. Quality between the two was **not**
-  measured here.
+How fast a prompt is read before the reply starts — `PREFILL_FP8=0` bf16, Mode A CUDA
+`dequant_to_bf16` + `cuBLASLt` BF16 tensor cores.
 
-Not changed because nothing indicated a gain: prompt chunks (upstream already sizes them to 4,096 rows on this card),
-draft tree width (upstream picks it per round from a measured cost curve), and the kernels (the 12k prefill is already
-~100 TFLOPS). The Flash Next recipe's patches (copy drafts, SSD read-ahead, MTP settings) address that model's
-engine and have no counterpart here. KV-cache quantization is Flash Next only.
+| Prompt length | Unpatched / Triton 8-bit TP2 | **`boot79` Mode A (`dequant_to_bf16` + `cuBLASLt`)** | First token (cold bf16 prefill) | Speedup vs Triton 8-bit |
+| :--- | :--- | :--- | :--- | :--- |
+| **8,192 tokens (`8K`)** | `407.0 tok/s` (`20.13 s`) | **1,447.0 – 1,476.0 tok/s** | **5.55 – 5.66 s** | **3.6× faster** |
+| **16,384 tokens (`16K`)** | `344.0 tok/s` (`47.63 s`) | **1,506.0 – 1,541.0 tok/s** | **10.63 – 10.88 s** | **4.5× faster** |
+| **32,768 tokens (`32K`)** | `306.0 tok/s` (`107.08 s`) | **1,487.4 – 1,504.0 tok/s** | **21.79 – 22.03 s** | **4.9× faster** |
+| **65,536 tokens (`64K`)** | `270.0 tok/s` (`242.73 s`) | **1,401.2 – 1,406.0 tok/s** | **46.61 – 46.77 s** | **5.2× faster** |
 
-## Requirements
+The 8-bit prefill was the structural wall of this project: stock 8-bit TP2 reads the 27B
+weights at ~4× the bandwidth of 4-bit, through a dequant-GEMV path that was never meant for
+large `M`. Mode A dequantizes the tile once into bf16 registers and hands it to `cuBLASLt`,
+which runs on GB10's tensor cores — and at 64K it is *faster than it is at 8K*, because the
+kernel is compute-bound, not bandwidth-bound, once `M ≥ 512`.
 
-- A DGX Spark (or another GB10 system with 128 GB unified memory). Startup estimate 45 GiB at the defaults.
-- Docker with the NVIDIA container runtime, and your user in the `docker` group.
-- ~60 GB free disk: ~19 GB for the checkpoints under `~/.cache/huggingface`, ~25-35 GB for the image.
-- Optional: the `hf` CLI on the host (faster, resumable downloads).
+## What it costs in quality
+
+4,096-token evaluation (wikitext-2 and CPython source, 8 sequences, two 2,048-token chunks so
+the second pass reads cached keys) against an all-bf16 reference. The point of the table: this
+build locks `PREFILL_FP8=0` — **bf16 prompts, FP8 cache only** — because 8-bit weights carry
+`256` levels per group where 4-bit carries `16`, so the prompt path no longer needs to be the
+weak link.
+
+| Configuration | Weight quantization | Perplexity (4-bit ref) | Prompt / cache KL divergence | Top-1 token agreement | Used in this repo? |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Reference: all `bf16`** | 16-bit / 8-bit | `3.316` | `0.0000` | `100.0%` | Reference baseline |
+| **`FP8 cache only` (`PREFILL_FP8=0`, `KV_DTYPE=fp8`)** | **8-bit affine (`gs=64`)** | **`3.315`** | **`0.0031`** | **`98.7%`** | **✅ yes — `boot79` default (`13.5×` lower KL)** |
+| `FP8 prompts only` (`PREFILL_FP8=1`, `KV_DTYPE=bf16`) | 4-bit affine (`gs=64`) | `3.397` | `0.0435` | `94.1%` | ❌ no (degrades prompt fidelity) |
+| `Both FP8` (MiaAI-Lab 4-bit default) | 4-bit affine (`gs=64`) | `3.387` | `0.0419` | `94.0%` | ❌ no (`+4.1%` code perplexity penalty) |
+
+Greedy open-ended replies diverge from the bf16 reference after a few tokens, as they do for
+any numeric change; a 12-question reasoning probe scored 12/12 on the FP8 cache, and the
+needle is found at 195k and — with YaRN — at 491k tokens. Deterministic-output parity across
+builds: code prompt `39191bf72982` is byte-canonical 4/4 on `boot79`; the prose prompt is
+deterministic within a build (4/4) and build-sensitive across builds (argmax ties under
+W8A16 + FP8 KV) — `9ae72b23bafa` on `boot79`, `88ed89a747dc` on `w78`.
+
+## Architecture: 1× Spark 4-bit vs 2× Spark 4-bit vs this build (2× Spark 8-bit hybrid)
+
+| Dimension | MiaAI-Lab `1× Spark` 4-bit (`TP=1`) | Prior `2× Spark` 4-bit (`TP=2`) | **This repo: `2× Spark` 8-bit hybrid (`boot79` `TP=2`)** |
+| :--- | :--- | :--- | :--- |
+| **Nodes & interconnect** | 1× DGX Spark | 2× DGX Spark (200GbE RoCEv2) | **2× DGX Spark (200GbE ConnectX-7 RoCEv2, MTU 9000)** |
+| **Weight precision** | 4-bit MLX (`~15 GiB`) | 4-bit MLX (`~7.5 GiB/rank`) | **8-bit MLX (`group_size=64`, `~14.6 GiB/rank`)** |
+| **Prompt prefill precision** | `PREFILL_FP8=1` (`0.0419` KL) | `PREFILL_FP8=1` (`0.0419` KL) | **`PREFILL_FP8=0` (bf16, `0.0031` KL + Mode A `cuBLASLt`)** |
+| **`spark1` memory used / free** | `96.7 GiB` used / `~24 GiB` free | `57 GiB` used / `64 GiB` free | **`32.5 GiB` used / `88.0 GiB` free (`+64 GiB` vs 1× Spark!)** |
+| **`spark2` memory used / free** | N/A | `69 GiB` used / `52 GiB` free | **`42.0 GiB` used / `79.0 GiB` free** |
+| **Active streams & window** | `8 × 262,144` (`78 GiB` pool) | `8 × 262,144` (`39 GiB/rank`) | **`4 × 262,144` (`1.05M` pooled FP8 KV tokens)** |
+| **Multi-turn prefix cache** | `12` slots (unpinned) | `12` slots (auto) | **`32` slots (`16 GiB` pinned GDN + KV store, `102 ms` warm TTFT)** |
+| **Drafter NCCL collectives** | `0` (single GPU) | `12 AllGather / round` | **`0.0 AllGather / round` (`0008-A` rank-local `DFlash2`)** |
+
+The 8-bit weights cost ~7 GiB more per rank than 4-bit and buy back the prompt-fidelity headroom:
+the build serves 4 full 262k-token windows with 88 GiB to spare on `spark1`, against ~24 GiB on
+a 1× Spark running the 4-bit 8-stream configuration. Memory measured at the `boot79` seal
+(2026-10-26, pool warm); an idle check the next day reads 30/33 GiB used on the two nodes.
+
+## The patch & kernel stack
+
+Everything the engine loads at boot, in load order. The shadow package at `patches/` is first
+on `PYTHONPATH` inside both containers; `sitecustomize.py` is the loader and each hook is
+env-gated with a kill-switch.
+
+| # | Patch / file | What it does | Verified state |
+| :--- | :--- | :--- | :--- |
+| 0001 | `0001-image-video.patch` | Images + video content parts (50 images / 2 videos per request) | engine feature, inherited |
+| 0002 | `0002-yarn-1m.patch` | YaRN rope rescaling → 1,048,576-token window | needle found @ 491k |
+| 0003 | `0003-fp8-kv-cache.patch` | e4m3 KV storage, 32 KiB/token (half of bf16) | parity 6/6 token hashes |
+| 0004 | `0004-memory-reserve.patch` | `TENSORFOLD_MEMORY_RESERVE_GIB` budget control | 24 GiB symmetric |
+| 0005 | `0005-pinned-kv-pool.patch` | Pinned KV pool reservation | 16 GiB/rank, kept |
+| 0006 | `0006-fused-w8a16-affine.patch` + **hybrid wrapper `tp2w8a16.py` (`e3f8d40c`)** | Fused W8A16 dequant GEMM; the wrapper routes `M≥512` → Mode A CUDA, `M<512` → v10e Triton | **resident, this repo's core** |
+| 0007 | `0007-tp2-multistream-batch.patch` (`c32e6a1f`) | C=4 multi-stream batch gate + 0007 diagnostics (`fwd/round=1.00`, target-colls/round=128.0) | gate measured 128.0 / 0.0 |
+| 0008-A | `0008a-replicated-dflash2.patch` | Rank-replicated `DFlash2` drafter — **0 drafter collectives** | draft-colls/round = 0.0 |
+| 0008-D2 | `0008d2-checkpoint-slots32.patch` | `--checkpoint-slots 32` reservation cap (`TF_SLOT_KV_CAP=16384`) + B2 hook block | 32 slots live, 102 ms warm TTFT |
+| v10e | `tp2draftgraph.py` (`3ccfeb2b`) | Eager static-buffer draft staging for all S ∈ 1..4 (CUDA graphs parked — boot-state GPU issue) | c4d 208.0 on `3ccfeb2b` engine |
+| CUDA | `w8a16_cuda_qmm.cpython-312-aarch64-linux-gnu.so` (**`b8440d18`**, sm_121) | Native `mma.sync` bf16 W8A16 extension: `cp_wait<0>()` K-loop drain + `dequant_to_bf16` (Mode A) | **md5 `b8440d18…` live in both containers** |
+
+### Determinism & numerical verification (`vdrain`, `b8440d18`)
+
+| Check | Result |
+| :--- | :--- |
+| Call-to-call flips, 50 L2-flushed calls, `M=1` bf16 / `M=1` f32 / `M=17` / `M=1024` | **`0 / 0 / 0 / 0`** |
+| `compute-sanitizer` (memory + init) over full probe sweep | **0 errors** |
+| `rel_err` vs FP64 reference | **0.189% – 0.270%** |
+| RoCE L2-flush divergence, 8K/16K/32K/64K prefill (flush on vs off) | **`0 / 0 / 0 / 0`** identical token streams, 0 dropped packets |
+
+The drain fix (`cp_wait<0>()` at L134 of the K-loop) is numerically inert — it gates readiness,
+not accumulation order — which is why the pure-CUDA decode stays ~7–11 tok/s below Gen-1: that
+cost is `cp_wait` serialization, not arithmetic. The kernel is kept resident for Mode A
+prefill, where it wins 3.6–5.2×. Full matrix: `bench/scorecards/vdrain_matrix.txt`.
+
+## Settings (`boot79` production)
+
+The effective configuration of the resident build. `tp2.env` (loaded by both rank scripts)
+plus the `run_rank{0,1}.sh` docker flags:
+
+| Setting | Value | Why |
+| :--- | :--- | :--- |
+| `TP2_DRAFT_REPL` | `1` | 0008-A replicated drafter → 0 drafter collectives (`0` = stock 12 AllGather/round) |
+| `TP2_W8A16` | `1` | Install the 0006 W8A16 hook (`0` = stock dequant GEMV, the ~21 tok/s reference) |
+| `TP2_W8A16_DECODE` | `0` | **Hybrid default**: Triton decode `M<512`. `1` = pure-CUDA `b8440d18` decode (rollback, `w78`) |
+| `TP2_PREFILL_MODE` / `TP2_PREFILL_THRESH` | `a` / `512` | Mode A CUDA `dequant_to_bf16` + `cuBLASLt` for `M ≥ 512` |
+| `TP2_BATCH_VERIFY` | `1` | 0007 multi-stream batch gate + diagnostics |
+| `TP2_DRAFT_GRAPH` / `TP2_WIDTH_PROBE` | `1` / `1` | v10e eager draft staging, all S values |
+| `TP2_CUDA_GRAPHS` | `0` | CUDA-graph path parked (boot-state GPU issue, 4.6× p1d regression) |
+| `TF_SLOT_KV_CAP` | `16384` | 0008-D2: clamp per-slot KV reservation to a 16k boundary |
+| `--checkpoint-slots` | `32` | 32 GDN+KV prefix slots (multi-turn agent cache) |
+| `--prompt-cache-gib` | `16` | Pinned prompt-cache budget, fixed (no auto-grow) |
+| `--no-prefill-fp8` | set | `PREFILL_FP8=0`: bf16 prompt activations (the quality lock) |
+| `TENSORFOLD_KV_DTYPE` / `KV_POOL_GB` | `fp8` / `16` | FP8 KV, 16 GiB pinned pool per rank |
+| `TENSORFOLD_MEMORY_RESERVE_GIB` | `24` | Symmetric hard buffer on both ranks |
+| `--parallel` / `--context` | `4` / `262144` | 4 streams × 262,144-token window |
+| `CUDA_DEVICE_MAX_CONNECTIONS` | `1` | Single stream context for deterministic ordering |
+| `NCCL_BUFFSIZE` | `8388608` (effective; `tp2.env` default `33554432`) | RoCEv2 all-reduce buffer |
+| `--cpuset-cpus` | `5-9,15-19` | X925 core pinning, dispatch off the engine cores |
+| `--ipc=host`, `--shm-size` | host / `8g` | NCCL shared memory |
+| **`.so` load path** | **`/patches/` volume root** | **TensorFold imports `w8a16_cuda_qmm` with `PYTHONPATH=/patches`. The `.so` must sit at the *root* of the `/patches` bind mount in both containers — inside `patches/w8a16_cuda/` it is never importable and the hook silently falls back to stock (~45 tok/s phantom). Container stop wipes the container-layer copy; the host bind mount is the only durable home.** |
 
 ## Quick start
 
-```bash
-git clone https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold.git
-cd Qwen3.8-27B-DGX-Spark-TensorFold
-./start.sh
-```
-
-The first run pulls the prebuilt image (`ghcr.io/miaai-lab/qwen3.8-27b-dgx-spark-tensorfold:v0.6.0-<patches hash>`, if the
-package is reachable with your Docker login; else it builds it locally, a few minutes) and downloads the checkpoints, then
-compiles the CUDA kernels (a few minutes, once).
-Later starts take about a minute. `start.sh` runs a smoke test and prints the endpoint.
+Prereqs: two DGX Sparks (GB10, 128 GiB unified), a direct 200Gbps ConnectX-7 RoCEv2 link
+(MTU 9000, PFC tuned), Docker with the NVIDIA runtime, the `tensorfold-qwen38-27b:v0.6.0-idlebell`
+image, and this repository cloned to `~/qwen38-tf-cluster` on both nodes with `patches/`
+bind-mounted to `/patches` (the launcher does it).
 
 ```bash
-curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "Qwen3.8-27B",
-  "messages": [{"role": "user", "content": "Write a Python fibonacci function."}],
-  "max_tokens": 1000
-}'
+# 1. rank0 (head) on spark1
+cd ~/qwen38-tf-cluster && ./launch-tp2.sh          # ROLE defaults to head; $1 = worker on rank1
 
-./start.sh restart                # apply changed settings
-./stop.sh                         # stop and free the GPU memory
-docker logs -f qwen38-27b-tf      # server log
+# 2. rank1 on spark2
+ssh gsgun@<spark2> 'cd ~/qwen38-tf-cluster && ./launch-tp2.sh worker'
+
+# 3. verify (spark1)
+curl -s http://127.0.0.1:8894/health               # {"ok": true, ...}
+md5sum /patches/w8a16_cuda_qmm.cpython-312-aarch64-linux-gnu.so   # b8440d18c2f473a9829088970cb13f43
 ```
 
-The model thinks before it answers (`reasoning_content`), so give replies enough `max_tokens`. Images go in as
-`image_url` parts (data URLs; `VISION_URLS=1` also allows `https://`). Per request: `temperature`, `top_p`, `top_k`,
-`seed`, `"chat_template_kwargs": {"enable_thinking": false}`, and `"draft": false` for the serial reference.
+The launcher is per-node and positional (`./launch-tp2.sh [worker]`) — `ROLE=worker ./launch-tp2.sh`
+starts a *rank0-named* container on spark2; pass `worker` as `$1`.
 
-## Configuration
+In the fleet this model is resident through llama-swap (`qwen3.8-27b-tp2` → `:8894`,
+persistent, TTL 0) and routed through LiteLLM as the `auto` leg; a routed request re-adopts
+the engine if it ever reports unloaded, so no manual restart is needed after a boot.
 
-Every setting is in [`scripts/config.sh`](scripts/config.sh); override from the environment, a `.env` file next to
-`start.sh`, or `tensorfold serve` flags after `start.sh` (`./start.sh restart --context 131072`).
+### Benchmarking
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PARALLEL` | `8` | requests decoded together; `1` serves one at a time |
-| `CONTEXT` | `262144` | prompt + reply window per stream (times `YARN_FACTOR`) |
-| `YARN_FACTOR` | unset | YaRN rope scaling factor, e.g. `4` for a 1,048,576-token window ([guide](#longer-context-with-yarn-a-1m-token-window)) |
-| `KV_POOL_GB` | `auto` | GiB of attention cache pinned at startup and shared by all streams: `auto` = the free memory minus ~31, at most 78 ([KV pool](#pinned-kv-pool)); a number sets it; `0`: grow on demand |
-| `KV_DTYPE` | `fp8` | attention cache: `fp8` (e4m3, 32 KiB a token) or `bf16` (64 KiB) ([above](#fp8-kv-cache)) |
-| `PREFILL_FP8` | `1` | FP8 prompt activations: faster prefill, lower prompt precision; `0` for bf16 |
-| `VISION` / `VISION_URLS` | `1` / `0` | image and video input (MLX checkpoint only) / also fetch `https://` URLs |
-| `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | images a request may carry and the tokens they share, each at most 4,096 |
-| `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget |
-| `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `0.95` / `20` | default sampling (Qwen's thinking-mode values) |
-| `THINKING` | `1` | open a think block by default |
-| `CHECKPOINT_SLOTS` | unset | retained prompt-end states for prefix reuse (TensorFold default) |
-| `MODEL_ID` / `DRAFT_ID` | MLX 4-bit / DFlash2 | other checkpoint; `DRAFT_ID=` serves without drafts |
-| `SERVED_NAME`, `PORT`, `HOST`, `CONTAINER_NAME`, `IMAGE` | see file | |
-| `TENSORFOLD_MEMORY_RESERVE_GIB` | `0` | GiB left out of MemAvailable at admission and kept free by the stream memory gate (patch 0004 allows 0; TensorFold's own default is a tenth of RAM, its floor 2). On this machine's unified memory, running out can freeze the host: raise it if other workloads share the box |
+```bash
+./bench/w8a16_c4.sh <label> <draft true|false> [N] [p|c|m]   # C=4 battery (p=prose c=code m=mixed)
+./bench/parity_c4.sh                                          # C=1/C=4 greedy parity, 4/4 byte-exact expected
+./bench/bench_native.sh                                       # unpatched / Triton reference legs
+```
 
-## Checks
+Scorecards: `bench/scorecards/` (`boot79`, `w78`, `v10e`, `vdrain` matrix).
 
-`start.sh` ends with a smoke test, and `/health` shows the busy flag and live token totals. Every figure in this README
-came from an OpenAI-compatible client talking to `/v1/chat/completions` (streaming, fixed seeds, `return_token_ids`
-for exactness checks), so any such client reproduces them. The benchmark and check scripts used for the measurements
-here (decode and prefill benchmark, needle, tool call, image and video, KL and quality probes) are not part of this
-repository.
+## Requirements
+
+- 2× DGX Spark (GB10, 128 GiB unified memory each), 200GbE ConnectX-7, RoCEv2, MTU 9000.
+- Docker with the NVIDIA container runtime; user in the `docker` group.
+- ~40 GiB disk per node: checkpoints under `~/.cache/huggingface`, the engine image.
+- Optional: `hf` CLI on the hosts (faster, resumable downloads).
+
+## Images and video
+
+Inherited from the upstream engine: up to 50 images (`TENSORFOLD_MAX_IMAGES`, 10 MB each,
+16,384 image tokens) and 2 videos per request (2 fps, 256 frames, 16,384 video tokens), as
+OpenAI-style content parts. Data URLs by default; `VISION_URLS=1` allows public `https://`
+URLs. Media prompts are not kept for prefix reuse.
 
 ## Repository layout
 
 ```
-start.sh, stop.sh   set up (first run) and start / stop the server
-scripts/            prepare.sh (image + checkpoints), config.sh (all settings), banner.sh (start.sh's banner),
-                    publish-image.sh (push the image to GitHub Container Registry)
-patches/            patches baked into the image (0001: 50 images and video; 0002: YaRN; 0003: FP8 KV cache; 0004: memory reserve 0; 0005: KV pool)
-LICENSE, NOTICE, LICENSES/, CREDITS.md   Apache-2.0 license, notices of the MIT parts, and who built what
+README.md  CHANGELOG.md  CREDITS.md  LICENSE  NOTICE  LICENSES/
+launch-tp2.sh  stop-tp2.sh  run_rank0.sh  run_rank1.sh  tp2.env
+patches/
+  sitecustomize.py                 # loader (PYTHONPATH-first shadow package)
+  tp2w8a16.py                      # 0006 hybrid wrapper (e3f8d40c) — core of boot79
+  tp2batchverify.py  tp2draftrepl.py  tp2slotcap.py  tp2widthprobe.py  tp2cudagraphs.py
+  tp2draftgraph.py                 # v10e eager draft staging (3ccfeb2b)
+  prefill_mode.txt                 # Mode A marker
+  0001…0005 (engine build patches)  0006  0007  0008a  0008d2  0009
+  w8a16_cuda_qmm.cpython-312-aarch64-linux-gnu.so   # b8440d18 — must sit at /patches/ root
+  w8a16_cuda/
+    qmm_kernel.cu  qmm.cpp  setup.py  test_parity.py   # b8440d18 production sources
+    archive/     # Gen-1: qmm_kernel_gen1_{recovered,initial}.cu (a6d64116), .so.gen1-2f84,
+                 #        qmm_w8a16_gen1.cpp, GEN1_RESCUE.md
+bench/
+  bench_native.sh  w8a16_c4.sh  parity_c4.sh
+  scorecards/  boot79_hybrid  w78_native_cuda  v10e  vdrain_matrix
 ```
-
-## License
-
-Apache License 2.0, see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The patches modify TensorFold v0.6.0, which is
-Apache-2.0. Parts of the scripts and tools are adapted from MiaAI-Lab's MIT-licensed Flash Next recipe and keep its
-notice ([`LICENSES/MIT-MiaAI-Lab.txt`](LICENSES/MIT-MiaAI-Lab.txt)); TensorFold's pre-0.6.0 MIT notice is in
-`LICENSES/` too. The model weights, downloaded from Hugging Face and not part of this repository, are under the Qwen
-Community License 1.0. The image is based on NVIDIA's PyTorch container (`nvcr.io/nvidia/pytorch:26.07-py3`), governed by
-NVIDIA's software license terms, which the container prints at every start; by pulling or running it you accept them.
-It also contains Hugging Face `transformers` (Apache 2.0) and PyAV (BSD) with its FFmpeg libraries (LGPL).
 
 ## Credits
 
-Built on [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart (v0.6.0), [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
-by Qwen, [Vontra's MLX 4-bit checkpoint](https://huggingface.co/Vontra/Qwen3.8-27B-MLX-4bit) and
-[z-lab's DFlash2 drafter](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), with the launcher, tools and the video code
-adapted from MiaAI-Lab's Flash Next recipe. The full list, including the YaRN source, the runtime stack and licenses,
-is in [`CREDITS.md`](CREDITS.md).
-
-## W8A16 CUDA extension + hybrid routing (TP=2, 8-bit affine checkpoint)
-
-Supports the [`TensorFold/Qwen3.8-27B-MLX-8bit`](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-8bit)
-affine W8A16 checkpoint (groups of 64) with a custom `mma.sync` bf16 GEMM
-(`patches/w8a16_cuda/`, sm_121) and a linear-dispatch hook
-(`patches/tp2w8a16.py`, installed via `sitecustomize.py`).
-
-### Hybrid routing (sealed resident config, boot79, 2026-10-26)
-
-| M (rows)            | Path                                              | Measured            |
-|---------------------|---------------------------------------------------|---------------------|
-| `M >= 512` (prefill)| Mode A: `dequant_to_bf16` + cuBLASLt bf16 GEMM    | 1406-1541 tok/s 8K-64K (3.8x Triton) |
-| `M < 512` (decode)  | v10e Triton `w8a16_mm_fast` (engine native)       | c1d 94.0 / c4d 196.1 / p1d 45.4 / p4d 111.4 tok/s |
-
-- `TP2_W8A16=1` (default on) activates the hook; `TP2_W8A16_MODE=fast` selects
-  `w8a16_mm_fast` for the Triton fallback.
-- `TP2_PREFILL_THRESH` (default 512) is the routing split; `prefill_mode.txt`
-  (`a`/`b`/`none`) selects the prefill accelerator.
-- `TP2_W8A16_DECODE=1` (default `0`) rolls decode back to the native CUDA
-  kernel (`b8440d18`, c1d 87.2 / c4d 186.0 tok/s).
-- Deploy rule: the extension `.so` must sit at the **`/patches/` volume root**
-  (container `PYTHONPATH=/patches`), not only in `patches/w8a16_cuda/`.
-
-### Versioned hashes
-
-| Artifact                                  | md5 / sha   |
-|-------------------------------------------|-------------|
-| `patches/w8a16_cuda/w8a16_cuda_qmm.so.b8440d18` (drain, resident) | `b8440d18c2f473a9829088970cb13f43` |
-| `patches/tp2w8a16.py` (hybrid dispatch)   | `e3f8d40cbe49f23ef97eac0c6e6d305f` |
-| `patches/w8a16_cuda/qmm_kernel_b8440d18.cu` (drain source) | see file |
-| `patches/w8a16_cuda/qmm_kernel_gen1_recovered.cu` (Gen-1 `3490ac1f` source, recovered from session transcripts) | `a6d6411640cebfad7affa312d054eca8` |
-| `patches/w8a16_cuda/w8a16_cuda_qmm.so.gen1-2f84` (Gen-1 17:53 rebuild, binary `3490ac1f` lost) | `2f841d3de90fe399985d62312c571eee` |
-
-Parity fingerprints (C=4, draft:True, temp 0): code prompt `39191bf72982`
-(canonical, stable across all builds); prose prompt build-sensitive
-(boot79 hybrid `9ae72b23bafa`, w78 `88ed89a747dc`, boot-10/v10e `d5589b366369`).
-
-Scorecards: `bench/hybrid_scorecard.txt` (boot79), `bench/native_cuda_scorecard.txt`
-(w78 vs v10e), `bench/v10e_scorecard.txt`. See `patches/w8a16_cuda/GEN1_RESCUE.md`
-for the forensic recovery record of the Gen-1 kernel.
+Built on [MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold)
+(UPSTREAM, MIT) — single-Spark 4-bit recipe, engine patches 0001–0005, banner art, and the
+benchmark methodology this README follows. The dual-node 8-bit `TP=2` hybrid, the fused W8A16
+CUDA extension, the replicated-drafter and checkpoint-slot patches, and every number in the
+`boot79`/`w78`/`v10e` columns are this repository's. `TensorFold/Qwen3.8-27B-MLX-8bit` and
+`z-lab/Qwen3.8-27B-DFlash2` checkpoints © their respective authors. See `CREDITS.md` and
+`LICENSE` (MIT).

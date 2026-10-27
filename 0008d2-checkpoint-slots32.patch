@@ -1,0 +1,57 @@
+--- a/patches/tensorfold/__init__.py
++++ b/patches/tensorfold/__init__.py
+@@ -46,6 +46,18 @@
+         _sys.stderr.write(f"tp2draftrepl: install failed: {_e!r}\n")
+         _sys.stderr.flush()
+ 
++# 0008-D2: cap checkpoint-slot KV reservation (0008-D 32 slots at 4x262144).
++# TF_SLOT_KV_CAP=16384 (default) clamps each slot's attn-KV reservation to a
++# 16k boundary; =0 restores the stock full-window reservation.
++if int(_os.environ.get("TF_SLOT_KV_CAP", "0") or 0) > 0:
++    try:
++        from tp2slotcap import install as _install08d2
++
++        _install08d2()
++    except Exception as _e:  # an optional patch must never break the server
++        _sys.stderr.write(f"tp2slotcap: install failed: {_e!r}\n")
++        _sys.stderr.flush()
++
+ if int(_os.environ.get("TF_PROF_ROUNDS", "0") or 0) > 0:
+     try:
+         from tfprof import install as _install_prof
+@@ -54,3 +66,35 @@
+     except Exception as _e:  # an optional probe must never break the server
+         _sys.stderr.write(f"tfprof: install failed: {_e!r}\n")
+         _sys.stderr.flush()
++
++# 0008-B2 Step-1 probe: read-only verify-width / stream distribution.
++# TP2_WIDTH_PROBE=1 logs (S, W) per decode round to TP2_WIDTH_PROBE_OUT.
++if _os.environ.get("TP2_WIDTH_PROBE", "0") == "1":
++    try:
++        from tp2widthprobe import install as _install_wprobe
++
++        _install_wprobe()
++    except Exception as _e:  # an optional probe must never break the server
++        _sys.stderr.write(f"tp2widthprobe: install failed: {_e!r}\n")
++        _sys.stderr.flush()
++
++# 0008-B2: two-graph CUDA capture (verify chain + draft launch_blocks).
++# TP2_CUDA_GRAPHS=1 (default) installs; =0 is the kill-switch (pure stock).
++# TP2_GRAPH_D=1 enables the draft graph; =0 (default) is Graph T only.
++if _os.environ.get("TP2_CUDA_GRAPHS", "1") != "0":
++    try:
++        from tp2cudagraphs import install as _install08b
++        _install08b()
++    except Exception as _e:  # an optional patch must never break the server
++        _sys.stderr.write(f"tp2cudagraphs: install failed: {_e!r}\n")
++        _sys.stderr.flush()
++
++# 0008-B2: Graph D — launch_blocks local CUDA graph (rank-0 world=1, 0 NCCL).
++# TP2_DRAFT_GRAPH=1 (default), independent of TP2_CUDA_GRAPHS.
++if _os.environ.get("TP2_DRAFT_GRAPH", "1") != "0":
++    try:
++        from tp2draftgraph import install as _install08d
++        _install08d()
++    except Exception as _e:
++        _sys.stderr.write(f"tp2draftgraph: install failed: {_e!r}\n")
++        _sys.stderr.flush()

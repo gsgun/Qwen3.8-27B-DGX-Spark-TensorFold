@@ -131,7 +131,7 @@ __global__ void __launch_bounds__(WM * WN * 32) w8a16_qmm_kernel(
     for (int g = 0; g < KG; ++g) {
         const int cur = g % STAGES;
         const int nxt = (g + STAGES - 1) % STAGES;
-        cp_wait<STAGES - 2>();
+        cp_wait<0>();
         __syncthreads();
 
         if (g + STAGES - 1 < KG) load(nxt, g + STAGES - 1);
@@ -284,6 +284,7 @@ void launch(const at::Tensor& x, const at::Tensor& w8, const at::Tensor& scales,
     }
 }
 
+
 } // anonymous namespace
 
 void w8a16_qmm_cuda(const at::Tensor& x, const at::Tensor& w8, const at::Tensor& scales,
@@ -309,4 +310,45 @@ void w8a16_qmm_cuda(const at::Tensor& x, const at::Tensor& w8, const at::Tensor&
     c10::cuda::CUDAGuard guard(x.device());
     if (f32) launch<64, true>(x, w8, scales, biases, out, N, K, M);
     else launch<64, false>(x, w8, scales, biases, out, N, K, M);
+}
+
+
+
+// ── Simple dequant kernel: w8 [N,K] + scales/biases [N,K/64] -> bf16 [N,K] ──
+__global__ void dequant_to_bf16_kernel(
+        const uint8_t* __restrict__ w8,
+        const __nv_bfloat16* __restrict__ scales,
+        const __nv_bfloat16* __restrict__ biases,
+        __nv_bfloat16* __restrict__ out,
+        int N, int K, int KG) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total) return;
+    
+    int n = idx / K;
+    int k = idx % K;
+    int g = k / 64;
+    
+    float w = static_cast<float>(w8[n * K + k]);
+    float s = __bfloat162float(scales[n * KG + g]);
+    float b = __bfloat162float(biases[n * KG + g]);
+    out[n * K + k] = __float2bfloat16_rn(w * s + b);
+}
+
+
+
+
+// Host wrapper for dequant kernel
+void dequant_to_bf16_host(const uint8_t* w8, const void* scales, const void* biases,
+                          void* out, int64_t N, int64_t K, int64_t KG) {
+    const int total = N * K;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dequant_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
+        w8,
+        static_cast<const __nv_bfloat16*>(scales),
+        static_cast<const __nv_bfloat16*>(biases),
+        static_cast<__nv_bfloat16*>(out),
+        (int)N, (int)K, (int)KG);
 }
