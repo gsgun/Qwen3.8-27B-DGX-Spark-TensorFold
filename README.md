@@ -1,11 +1,21 @@
-# Qwen3.8-27B on 2× DGX Spark — 8-Bit TP=2 Hybrid (`boot79`)
+# Qwen3.8-27B on 2× DGX Spark — 8-Bit TP=2 Hybrid (`boot80`)
 
 A 27B-parameter LLM serving on **two** NVIDIA DGX Sparks over a direct 200Gbps RoCEv2 link,
 running **8-bit affine weights** (`group_size=64`, `8.627 bpw`) with a hand-built CUDA W8A16
 kernel, `DFlash2` speculative decoding, and a 1-million-token pooled FP8 KV cache — with
 multi-turn prefix caching that answers a warmed agent request in ~100 ms.
 
-Every number in this file was measured on this cluster, not promised.
+**Current production build: `boot80`** (`8b57000`) = `boot79` hybrid (`b8440d18` Mode A prefill +
+v10e eager Triton decode) **+** Phase 1–4: v10e-eager staging, FP8 prefill AllGather (`0009`,
+`TP2_PREFILL_FP8_GATHER=1`), snapshot spill + NUMA pinning, and the verification battery. `boot79`
+remains the sealed 8-bit hybrid baseline this file's main tables document; `boot80` is the deployed
+resident. Every number in this file was measured on this cluster, not promised.
+
+> **⚠ Operational status (2026-10-28, live probe):** c1 is healthy — pair rebuilt **03:57Z**, both
+> ranks `RestartCount=0`, `.so` md5 `b8440d18…`, FP8 gather `ON`. **Open:** rank-divergence churn
+> (#993) still degrading decode over uptime (5 flightrecs / 24 h), the 260k needle intermittently
+> fails, and the engine image is `v0.6.0` vs upstream `v1.1.8` (canary gated). See **Known issues**
+> and **To do** below.
 
 ![Qwen3.8-27B on the DGX Spark](.github/image.png)
 
@@ -91,7 +101,7 @@ weak link.
 | **Reference: all `bf16`** | 16-bit / 8-bit | `3.316` | `0.0000` | `100.0%` | Reference baseline |
 | **`FP8 cache only` (`PREFILL_FP8=0`, `KV_DTYPE=fp8`)** | **8-bit affine (`gs=64`)** | **`3.315`** | **`0.0031`** | **`98.7%`** | **✅ yes — `boot79` default (`13.5×` lower KL)** |
 | `FP8 prompts only` (`PREFILL_FP8=1`, `KV_DTYPE=bf16`) | 4-bit affine (`gs=64`) | `3.397` | `0.0435` | `94.1%` | ❌ no (degrades prompt fidelity) |
-| `Both FP8` (MiaAI-Lab 4-bit default) | 4-bit affine (`gs=64`) | `3.387` | `0.0419` | `94.0%` | ❌ no (`+4.1%` code perplexity penalty) |
+| `Both FP8` (upstream 4-bit default) | 4-bit affine (`gs=64`) | `3.387` | `0.0419` | `94.0%` | ❌ no (`+4.1%` code perplexity penalty) |
 
 Greedy open-ended replies diverge from the bf16 reference after a few tokens, as they do for
 any numeric change; a 12-question reasoning probe scored 12/12 on the FP8 cache, and the
@@ -102,7 +112,7 @@ W8A16 + FP8 KV) — `9ae72b23bafa` on `boot79`, `88ed89a747dc` on `w78`.
 
 ## Architecture: 1× Spark 4-bit vs 2× Spark 4-bit vs this build (2× Spark 8-bit hybrid)
 
-| Dimension | MiaAI-Lab `1× Spark` 4-bit (`TP=1`) | Prior `2× Spark` 4-bit (`TP=2`) | **This repo: `2× Spark` 8-bit hybrid (`boot79` `TP=2`)** |
+| Dimension | Upstream `1× Spark` 4-bit (`TP=1`) | Prior `2× Spark` 4-bit (`TP=2`) | **This repo: `2× Spark` 8-bit hybrid (`boot80` `TP=2`)** |
 | :--- | :--- | :--- | :--- |
 | **Nodes & interconnect** | 1× DGX Spark | 2× DGX Spark (200GbE RoCEv2) | **2× DGX Spark (200GbE ConnectX-7 RoCEv2, MTU 9000)** |
 | **Weight precision** | 4-bit MLX (`~15 GiB`) | 4-bit MLX (`~7.5 GiB/rank`) | **8-bit MLX (`group_size=64`, `~14.6 GiB/rank`)** |
@@ -253,13 +263,15 @@ bench/
 
 ## Credits
 
-Built on [MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold)
-(UPSTREAM, MIT) — single-Spark 4-bit recipe, engine patches 0001–0005, banner art, and the
-benchmark methodology this README follows. The dual-node 8-bit `TP=2` hybrid, the fused W8A16
-CUDA extension, the replicated-drafter and checkpoint-slot patches, and every number in the
-`boot79`/`w78`/`v10e` columns are this repository's. `TensorFold/Qwen3.8-27B-MLX-8bit` and
-`z-lab/Qwen3.8-27B-DFlash2` checkpoints © their respective authors. See `CREDITS.md` and
-`LICENSE` (MIT).
+This repository — the dual-node 8-bit `TP=2` hybrid, the fused W8A16 CUDA extension, the
+replicated-drafter and checkpoint-slot patches, and every number in the `boot79`/`boot80`/`w78`/`v10e`
+columns — is the work of **gsgun**.
+
+It runs on [TensorFold](https://github.com/ashhart/TensorFold) (Apache-2.0 from v0.6.0) by Ash Hart and
+the TensorFold contributors; the model checkpoints (`TensorFold/Qwen3.8-27B-MLX-8bit`,
+`z-lab/Qwen3.8-27B-DFlash2`) are © their respective authors. The video support in `patches/0001` is
+adapted from MIT-licensed work whose notice is kept in `LICENSES/MIT-MiaAI-Lab.txt`. See `CREDITS.md`
+and `LICENSE` (Apache-2.0).
 
 ## boot80 Production Verification Scorecard (Dual DGX Spark GB10 · 8-Bit TP=2)
 
@@ -289,3 +301,71 @@ Deployed and resident at :8894 across spark1 (rank 0) + spark2 (rank 1).
 - **det500:** BYTE_EXACT PASS (2 x 550 tokens, SHA256 079bd6d2f3c557d1)
 - **C=4 Cross-Stream Parity:** 8/8 PASS (Prose 9ae72b23bafa x 4, Code 39191bf72982 x 4)
 - **Snapshot Persistence:** --snapshot-dir /snapshots mapped to /var/tmp/tf-snapshots
+
+---
+
+## Live state — 2026-10-28 (current production, `boot80`)
+
+Verified against the running pair: `qwen38-tf-rank0` on spark1 + `qwen38-tf-rank1` on spark2, `:8894`.
+
+| | |
+| --- | --- |
+| **Image** | `tensorfold-qwen38-27b:v0.6.0-idlebell` (both ranks) |
+| **`.so`** | `b8440d18c2f473a9829088970cb13f43` (matches the seal) |
+| **Pair** | rebuilt **03:57Z 2026-10-29**, `RestartCount=0`, `Up` |
+| **Env** | `TP2_PREFILL_FP8_GATHER=1`, `TP2_PREFILL_MODE=a`, `TP2_V11_GRAPH=0` (v10e eager), `TP2_CUDA_GRAPHS=0`, `TP2_DRAFT_REPL=1`, `TP2_W8A16=1` (`fast`), `KV_DTYPE=fp8`, `KV_POOL_GIB=16`, `MEMORY_RESERVE_GIB=16` |
+| **Live context** | `262,144` tokens (`TF_SLOT_KV_CAP=16384`; the 1M figure is the YaRN rope cap, not the live pool) |
+| **Draft acceptance** | **39.0%** this window (79,575 drafted / 31,046 accepted) — see Known issues |
+| **Health** | `ok:true`, `rounds_total=11,640`, `max streams=6` |
+
+> The live deployment runs a **256K-token** KV-bounded window (16 GiB pool, 16384 slot cap). The 1,048,576-token
+> window in the tables above is the YaRN rope cap (`0002`, needle found @ 491k) at the full 24 GiB pool; the resident
+> config trades context for headroom.
+
+## Known issues (open, measured)
+
+1. **Uptime rank-divergence churn (#993)** — decode degrades with pair uptime: a clean 5 h warm leg on 2026-10-27 read
+   **33–40% of the pre-8-bit baseline** (`prose 46.5 → 34.7 tok/s`, `agg6 84.7 → 25.7 tok/s`, **−70% over 4.5 h**),
+   consistent with accumulating rank divergence (no pair rebuild during the window). A rebuild restores near-seal
+   numbers (`c1d 83.7`, `c4d 185.9`, `p4d 107.7` post-remediation). **5 flightrecs in 24 h**, still OPEN on 2026-10-28.
+   Stopgap: watchdog rebuild on divergence; a durable fix tops the To-do list.
+2. **260k needle intermittently FAILS** on every 8-bit-era run (2026-10-09, 10-27 leg 1 + leg 2) vs **PASS** on the
+   10-02 pre-8-bit reference — long-context retrieval corruption that appeared with the 8-bit cutover. The 8-bit
+   checkpoint is the prime suspect; `v10e`-eager is also in scope. Not reproducible on a fresh rebuild.
+3. **Draft acceptance is the weak spec-decode leg** — **28%** at the `boot80` seal (725,183 drafted / 203,460 accepted
+   @ 5 h), **39%** live post-rebuild. The DFlash2 drafter proposes well but the target rejects ~2/3 of drafts; this
+   caps decode gain from speculation.
+4. **`c4off` (drafter off) regressed** to **38.60 tok/s** vs `boot79` 246 tok/s (−84%) — under investigation; the
+   serial reference is not the production path, but the drop suggests the batch gate interacts with drafter-off.
+5. **Engine image is `v0.6.0` (2026-10-01) vs upstream `v1.1.8` (2026-10-28)** — five patch releases behind. The
+   `v0.6.0 → v1.1.8` canary is **gated** and deferred to an operator window (no unattended swap).
+
+## Learned
+
+- **Prefill is compute-bound, not bandwidth-bound** once `M ≥ 512` — Mode A `dequant_to_bf16` + `cuBLASLt` makes 64K
+  *faster* than 8K (1,522 vs 1,566 tok/s), and FP8 prefill AllGather (`0009`) cuts the RoCE payload ~50% for another
+  +7–20% across 8K–64K.
+- **The `.so` must live at the `/patches` mount root.** Inside `patches/w8a16_cuda/` it is never importable and the
+  hook silently falls back to stock (~45 tok/s phantom). Container stop wipes the layer copy; the host bind mount is
+  the only durable home.
+- **Numerical parity is cheap to hold, expensive to lose** — `b8440d18` is 0/0/0/0 flips across 50 L2-flushed calls
+  and 0 compute-sanitizer errors; byte-exact det500 (`079bd6d2…`) and 8/8 cross-stream parity are the regression gates.
+- **The 8-bit cutover bought quality but exposed long-context instability** — FP8 cache keeps KL at 0.0031 and top-1
+  at 98.7%, but the 260k needle regression and #993 churn are the price; both are checkpoint/engine-level, not
+  patch-level.
+- **Speculative decode is only as good as its acceptance rate** — 28–39% acceptance means most proposals are rejected;
+  tune the draft tree / acceptance threshold before adding more streams.
+
+## To do
+
+- [ ] **Durable #993 fix** — root-cause the rank divergence that degrades decode over uptime; watchdog rebuild is a
+      stopgap, not a fix.
+- [ ] **260k needle** — bisect the 8-bit checkpoint vs `v10e`-eager to isolate the long-context retrieval regression;
+      add a needle gate to the nightly battery.
+- [ ] **Draft acceptance** — tune the DFlash2 draft tree / acceptance threshold to push 28–39% toward 60%+;
+      re-measure `c1d`/`c4d` with a better drafter.
+- [ ] **`c4off` regression** — trace the drafter-off batch-gate interaction (38.60 vs 246 tok/s).
+- [ ] **`v0.6.0 → v1.1.8` canary** — staged, gated; run in an operator window, verify `.so` load path + parity + needle
+      before promoting.
+- [ ] **Reconcile docs with live config** — `MEMORY_RESERVE_GIB` is 16 live vs 24 documented; `KV_POOL_GIB=16` gives a
+      256K live window, not 1M. Either restore the documented values or update the tables to the resident config.

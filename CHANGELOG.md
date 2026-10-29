@@ -1,3 +1,22 @@
+## 2026-10-28 — Live state, known issues, and To-do (`boot80` resident)
+
+- **Current production build is `boot80`** (`8b57000`): `boot79` hybrid (`b8440d18` Mode A prefill + v10e eager
+  Triton decode) plus Phase 1–4 (v10e-eager staging, FP8 prefill AllGather `0009`, snapshot spill + NUMA pinning,
+  verification battery). Live on c1 = `qwen38-tf-rank0` (spark1) + `rank1` (spark2), image
+  `tensorfold-qwen38-27b:v0.6.0-idlebell`, `.so` `b8440d18…`, `RestartCount=0`.
+- **Live config drift documented**: `MEMORY_RESERVE_GIB=16` (not the 24 in the seal tables) and `KV_POOL_GIB=16`
+  give a **256K-token** live window (`TF_SLOT_KV_CAP=16384`); the 1M figure is the YaRN rope cap, not the resident
+  pool. See README "Live state".
+- **Known issues added** (README): #993 uptime rank-divergence churn (c1 decode 33–40% of pre-8-bit baseline in a 5 h
+  warm leg, agg6 −70% over 4.5 h; 5 flightrecs/24 h, OPEN); 260k needle intermittent FAIL on 8-bit-era runs vs PASS on
+  10-02; draft acceptance 28% seal / 39% live; `c4off` regression 38.60 vs 246 tok/s; engine `v0.6.0` vs upstream
+  `v1.1.8` (canary gated).
+- **"Learned" and "To do" sections added** to the README: prefill compute-bound at M≥512, `/patches`-root `.so` rule,
+  parity gates, 8-bit long-context instability, spec-decode acceptance ceiling; and the #993 durable fix, 260k needle
+  bisect, draft-tree tuning, `c4off` trace, v1.1.8 canary, and doc/config reconciliation.
+- **Credits simplified** to the repository author (gsgun); the required MIT notice for the adapted video code stays in
+  `LICENSES/MIT-MiaAI-Lab.txt`.
+
 ## 2026-10-27 — Repository realigned to the boot79 8-bit TP=2 hybrid
 
 - **README rewritten**: the repo is now 100% dedicated to the dual-DGX-Spark 8-bit `TP=2`

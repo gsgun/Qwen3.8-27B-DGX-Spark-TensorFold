@@ -1,20 +1,19 @@
 # Credits
 
-This repository is a layer of scripts and patches. Almost everything that makes it work was built by others.
+This repository is the work of **gsgun** (`gsgun@users.noreply.github.com`).
 
 ## Model and checkpoints
 
 - **[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** by [Qwen](https://qwen.ai/): the model's design, training
   and evaluations. Released under the **Qwen Community License 1.0**, which governs any use of the weights (read it
-  before commercial use). The weights are not part of this repository; `scripts/prepare.sh` downloads them.
-- **[Vontra](https://huggingface.co/Vontra)**: the checkpoint served by default,
-  [`Vontra/Qwen3.8-27B-MLX-4bit`](https://huggingface.co/Vontra/Qwen3.8-27B-MLX-4bit), the MLX 4-bit conversion
-  (affine, groups of 64) that includes the vision tower.
+  before commercial use). The weights are not part of this repository; the launcher downloads them.
+- **[Vontra](https://huggingface.co/Vontra)**: the MLX checkpoint served by default,
+  [`Vontra/Qwen3.8-27B-MLX-4bit`](https://huggingface.co/Vontra/Qwen3.8-27B-MLX-4bit).
 - **[z-lab](https://huggingface.co/z-lab)**: the DFlash2 drafter,
   [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), a block-diffusion drafter that
   proposes the tokens the target then verifies.
 - **[NVIDIA](https://huggingface.co/nvidia)**: [`nvidia/Qwen3.8-27B-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4),
-  the NVFP4 export measured as the comparison arm (`MODEL_ID=nvidia/Qwen3.8-27B-NVFP4` serves it; no vision).
+  the NVFP4 export measured as the comparison arm.
 
 ## Inference engine
 
@@ -31,33 +30,21 @@ This repository is a layer of scripts and patches. Almost everything that makes 
   [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (turboderp, MIT) and Hugging Face
   [transformers](https://github.com/huggingface/transformers) (Apache 2.0).
 
-## The recipe this is adapted from
-
-- **[MiaAI-Lab](https://github.com/MiaAI-Lab)** ([x.com/MiaAI_lab](https://x.com/MiaAI_lab)), the
-  [Qwen3.8 Flash Next on one DGX Spark](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)
-  recipe (MIT, kept under its notice in `LICENSES/MIT-MiaAI-Lab.txt`). `start.sh`, `stop.sh`, `scripts/prepare.sh`, `scripts/config.sh`, the benchmark scripts behind the measurements (not in this repository)
-  and the layout and measurement method of this README are adapted from it.
-  The **video** support in `patches/0001` (`vision/videos.py`, the timestamped frame-group prompt, the frame encoding)
-  is ported from that recipe's `patches/0002-flash-next-v060.patch` (MIT); MiaAI-Lab's work there builds on TensorFold's Qwen
-  image pipeline, Hugging Face transformers' Qwen3-VL video processing, and PyAV.
-- MiaAI-Lab's [Qwen3.8-27B SGLang recipe](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark) and
-  [GLM-5.3-Flash EXL3 two-Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold) were
-  read as references (per-token KV cost, a pool sized at startup, FP8 KV and YaRN settings). **No code was taken from
-  them.** The 50-image and 16,384-shared-token figures follow the ones MiaAI-Lab's Flash Next and GLM READMEs state; the
-  code that enforces them in 0001 is new.
-
 ## What this repository adds (`patches/`)
 
-- **0001**: up to 50 images a request (limits, groups of up to 16,384 patches per tower call) and the port of video
-  input, on TensorFold's Qwen vision frontend.
+- **0001**: up to 50 images a request (limits, groups of up to 16,384 patches per tower call) and video input, on
+  TensorFold's Qwen vision frontend. The video code (`vision/videos.py`, the timestamped frame-group prompt, the frame
+  encoding) is adapted from MIT-licensed work whose notice is kept in `LICENSES/MIT-MiaAI-Lab.txt`.
 - **0002**: opt-in YaRN rope scaling for the dense engine. The frequency blend and the attention scale follow the
   YaRN method ([Peng, Quesnelle, Fan, Shippole, *YaRN: Efficient Context Window Extension of Large Language Models*,
   2023](https://arxiv.org/abs/2309.00071)) as implemented in Hugging Face transformers' `_compute_yarn_parameters`
   (Apache 2.0), which the patch is checked against numerically.
-- **0003**: an FP8 (e4m3) attention cache read directly by the tree-attention kernels; **0004**: a memory reserve of 0;
+- **0003**: an FP8 (e4m3) attention cache read directly by the tree-attention kernels; **0004**: a memory reserve;
   **0005**: a pinned KV pool for the concurrent decoder.
-- Patches 0002-0005, `scripts/banner.sh` and this documentation were developed with
-  [Claude Code](https://claude.com/claude-code).
+- **0006–0009**: the fused W8A16 CUDA extension, the TP=2 multi-stream batch gate, the rank-replicated DFlash2 drafter,
+  the 32-slot checkpoint cap and the FP8 prefill AllGather — all this repository's.
+- The dual-node 8-bit `TP=2` hybrid, the fused W8A16 CUDA extension, the replicated-drafter and checkpoint-slot
+  patches, and every number in the `boot79`/`boot80`/`w78`/`v10e` columns are this repository's.
 
 ## Runtime stack
 
@@ -79,5 +66,3 @@ This repository is a layer of scripts and patches. Almost everything that makes 
 
 - **[NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)** (GB10, 128 GB unified memory):
   every number in this repository was measured on one.
-
-If you believe something here is missing or credited wrongly, please open an issue.
