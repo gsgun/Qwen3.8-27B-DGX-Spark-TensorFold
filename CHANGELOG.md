@@ -14,8 +14,8 @@
 - **"Learned" and "To do" sections added** to the README: prefill compute-bound at M≥512, `/patches`-root `.so` rule,
   parity gates, 8-bit long-context instability, spec-decode acceptance ceiling; and the #993 durable fix, 260k needle
   bisect, draft-tree tuning, `c4off` trace, v1.1.8 canary, and doc/config reconciliation.
-- **Credits simplified** to the repository author (gsgun); the required MIT notice for the adapted video code stays in
-  `LICENSES/MIT-MiaAI-Lab.txt`.
+- **Credits**: author-only contributor list (gsgun); the "recipe this is adapted from" provenance (MiaAI-Lab
+  single-Spark 4-bit recipe, MIT) restored in `CREDITS.md`/README; no Claude/Anthropic contributor line.
 
 ## 2026-10-27 — Repository realigned to the boot79 8-bit TP=2 hybrid
 

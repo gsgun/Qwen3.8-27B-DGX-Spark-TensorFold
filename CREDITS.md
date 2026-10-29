@@ -30,6 +30,22 @@ This repository is the work of **gsgun** (`gsgun@users.noreply.github.com`).
   [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (turboderp, MIT) and Hugging Face
   [transformers](https://github.com/huggingface/transformers) (Apache 2.0).
 
+## The recipe this is adapted from
+
+- **[MiaAI-Lab](https://github.com/MiaAI-Lab)** ([x.com/MiaAI_lab](https://x.com/MiaAI_lab)), the
+  [Qwen3.8 Flash Next on one DGX Spark](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)
+  recipe (MIT, kept under its notice in `LICENSES/MIT-MiaAI-Lab.txt`). `start.sh`, `stop.sh`, `scripts/prepare.sh`,
+  `scripts/config.sh`, the benchmark scripts behind the measurements (not in this repository) and the layout and
+  measurement method of this README are adapted from it. The **video** support in `patches/0001` (`vision/videos.py`,
+  the timestamped frame-group prompt, the frame encoding) is ported from that recipe's
+  `patches/0002-flash-next-v060.patch` (MIT); MiaAI-Lab's work there builds on TensorFold's Qwen image pipeline,
+  Hugging Face transformers' Qwen3-VL video processing, and PyAV.
+- MiaAI-Lab's [Qwen3.8-27B SGLang recipe](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark) and
+  [GLM-5.3-Flash EXL3 two-Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold) were
+  read as references (per-token KV cost, a pool sized at startup, FP8 KV and YaRN settings). **No code was taken from
+  them.** The 50-image and 16,384-shared-token figures follow the ones MiaAI-Lab's Flash Next and GLM READMEs state;
+  the code that enforces them in 0001 is new.
+
 ## What this repository adds (`patches/`)
 
 - **0001**: up to 50 images a request (limits, groups of up to 16,384 patches per tower call) and video input, on

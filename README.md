@@ -267,11 +267,12 @@ This repository — the dual-node 8-bit `TP=2` hybrid, the fused W8A16 CUDA exte
 replicated-drafter and checkpoint-slot patches, and every number in the `boot79`/`boot80`/`w78`/`v10e`
 columns — is the work of **gsgun**.
 
-It runs on [TensorFold](https://github.com/ashhart/TensorFold) (Apache-2.0 from v0.6.0) by Ash Hart and
-the TensorFold contributors; the model checkpoints (`TensorFold/Qwen3.8-27B-MLX-8bit`,
-`z-lab/Qwen3.8-27B-DFlash2`) are © their respective authors. The video support in `patches/0001` is
-adapted from MIT-licensed work whose notice is kept in `LICENSES/MIT-MiaAI-Lab.txt`. See `CREDITS.md`
-and `LICENSE` (Apache-2.0).
+Adapted from the **[MiaAI-Lab](https://github.com/MiaAI-Lab) single-Spark 4-bit recipe** (MIT): the
+`start.sh`/`stop.sh`/`scripts/` launcher, the README layout and measurement method, and the video code in
+`patches/0001` — its notice is kept in `LICENSES/MIT-MiaAI-Lab.txt`. It runs on
+[TensorFold](https://github.com/ashhart/TensorFold) (Apache-2.0 from v0.6.0) by Ash Hart and the TensorFold
+contributors; the model checkpoints (`TensorFold/Qwen3.8-27B-MLX-8bit`, `z-lab/Qwen3.8-27B-DFlash2`) are © their
+respective authors. See `CREDITS.md` and `LICENSE` (Apache-2.0).
 
 ## boot80 Production Verification Scorecard (Dual DGX Spark GB10 · 8-Bit TP=2)
 
