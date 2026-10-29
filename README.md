@@ -1,21 +1,24 @@
-# Qwen3.8-27B on 2× DGX Spark — 8-Bit TP=2 Hybrid (`boot80`)
+# Qwen3.8-27B on 2× DGX Spark — 8-Bit TP=2 Hybrid (`boot91`)
 
 A 27B-parameter LLM serving on **two** NVIDIA DGX Sparks over a direct 200Gbps RoCEv2 link,
 running **8-bit affine weights** (`group_size=64`, `8.627 bpw`) with a hand-built CUDA W8A16
 kernel, `DFlash2` speculative decoding, and a 1-million-token pooled FP8 KV cache — with
 multi-turn prefix caching that answers a warmed agent request in ~100 ms.
 
-**Current production build: `boot80`** (`8b57000`) = `boot79` hybrid (`b8440d18` Mode A prefill +
-v10e eager Triton decode) **+** Phase 1–4: v10e-eager staging, FP8 prefill AllGather (`0009`,
-`TP2_PREFILL_FP8_GATHER=1`), snapshot spill + NUMA pinning, and the verification battery. `boot79`
-remains the sealed 8-bit hybrid baseline this file's main tables document; `boot80` is the deployed
-resident. Every number in this file was measured on this cluster, not promised.
+**Current production build: `boot91`** = `boot80` (`8b57000`) + the boot90/boot91 line: **PAR=6**
+(6 × 262,144 = **1,572,864 pooled tokens**, 24 GiB fp8 KV/rank), the **v11 draft suite** (`S≤8`,
+`tp2draftgraph.py` `44e592fd`), RoCE MTU-9000 jumbo self-heal, `RESERVE_GIB=16`, `--prompt-cache-gib 32`,
+and `TP2_PREFILL_MODE` passthrough. `boot79`/`boot80` remain the sealed 8-bit hybrid baselines this
+file's main tables document; `boot91` is the deployed resident. Every number in this file was measured
+on this cluster, not promised.
 
-> **⚠ Operational status (2026-10-28, live probe):** c1 is healthy — pair rebuilt **03:57Z**, both
-> ranks `RestartCount=0`, `.so` md5 `b8440d18…`, FP8 gather `ON`. **Open:** rank-divergence churn
-> (#993) still degrading decode over uptime (5 flightrecs / 24 h), the 260k needle intermittently
-> fails, and the engine image is `v0.6.0` vs upstream `v1.1.8` (canary gated). See **Known issues**
-> and **To do** below.
+> **⚠ Operational status (2026-10-28 ~21:xx PDT, live probe):** c1 is **boot91**, healthy —
+> `qwen38-tf-rank0`+`rank1` `RestartCount=0`, `.so` md5 `b8440d18…`, draft module `44e592fd…` (v11),
+> FP8 gather `ON`, `max streams=6`, `ctx=262,144`/slot (6 slots = 1,572,864 pooled). **Open:** a **~2×
+> decode regression vs boot90** (c1d **45.6** vs **85–89** tok/s) attributed to the v6-stride→v11 draft
+> swap (pending clean A/B); the RoCE link is at **109.16 Gb/s of 200G** with lane-0 PHY errors; and the
+> engine image is `v0.6.0` vs upstream `v1.1.8` (canary gated). boot91 is **not yet committed** to any
+> repo. See **Known issues** and **To do** below.
 
 ![Qwen3.8-27B on the DGX Spark](.github/image.png)
 
@@ -305,7 +308,7 @@ Deployed and resident at :8894 across spark1 (rank 0) + spark2 (rank 1).
 
 ---
 
-## Live state — 2026-10-28 (current production, `boot80`)
+## Live state — 2026-10-28 (current production, `boot91`)
 
 Verified against the running pair: `qwen38-tf-rank0` on spark1 + `qwen38-tf-rank1` on spark2, `:8894`.
 
@@ -313,15 +316,33 @@ Verified against the running pair: `qwen38-tf-rank0` on spark1 + `qwen38-tf-rank
 | --- | --- |
 | **Image** | `tensorfold-qwen38-27b:v0.6.0-idlebell` (both ranks) |
 | **`.so`** | `b8440d18c2f473a9829088970cb13f43` (matches the seal) |
-| **Pair** | rebuilt **03:57Z 2026-10-29**, `RestartCount=0`, `Up` |
-| **Env** | `TP2_PREFILL_FP8_GATHER=1`, `TP2_PREFILL_MODE=a`, `TP2_V11_GRAPH=0` (v10e eager), `TP2_CUDA_GRAPHS=0`, `TP2_DRAFT_REPL=1`, `TP2_W8A16=1` (`fast`), `KV_DTYPE=fp8`, `KV_POOL_GIB=16`, `MEMORY_RESERVE_GIB=16` |
-| **Live context** | `262,144` tokens (`TF_SLOT_KV_CAP=16384`; the 1M figure is the YaRN rope cap, not the live pool) |
-| **Draft acceptance** | **39.0%** this window (79,575 drafted / 31,046 accepted) — see Known issues |
-| **Health** | `ok:true`, `rounds_total=11,640`, `max streams=6` |
+| **Draft module** | `tp2draftgraph.py` `44e592fd240a0c775dcec90378b6aefc` (v11, `S≤8`) |
+| **Geometry** | **PAR=6**, `CTX=262,144`/slot → **1,572,864 pooled tokens** (24 GiB fp8 KV/rank) |
+| **Pair** | `qwen38-tf-rank0`+`rank1`, `RestartCount=0`, `Up` |
+| **Env** | `TP2_PREFILL_FP8_GATHER=1`, `TP2_PREFILL_MODE=a`, `TP2_V11_GRAPH=0` (v10e eager), `TP2_CUDA_GRAPHS=0`, `TP2_DRAFT_REPL=1`, `TP2_W8A16=1` (`fast`), `KV_DTYPE=fp8`, `MEMORY_RESERVE_GIB=16`, `NCCL_IB_QPS_PER_CONNECTION=4` |
+| **Health** | `ok:true`, `rounds_total=24,111`, `drafted=234,468`, `accepted=70,170` (**29.9%**), `max streams=6` |
 
-> The live deployment runs a **256K-token** KV-bounded window (16 GiB pool, 16384 slot cap). The 1,048,576-token
-> window in the tables above is the YaRN rope cap (`0002`, needle found @ 491k) at the full 24 GiB pool; the resident
-> config trades context for headroom.
+> The live deployment is **PAR=6 × 262,144 = 1,572,864 pooled tokens** at 24 GiB fp8 KV/rank. The
+> 1,048,576-token single-slot window in the tables above is the YaRN rope cap (`0002`, needle found @
+> 491k); boot91 runs six 262K slots rather than one 1M slot, trading depth-per-request for concurrency.
+
+## boot91 measured scorecard (PAR=6 · CTX=262,144 · 2026-10-28 21:48–21:57 PDT)
+
+| Arm | tok/s | detail |
+| --- | ---: | --- |
+| **c1d** (prose, 1×512) | **45.59** | 93 rounds, 418 accepted, 11.23 s wall |
+| **p1d** (code, 1×512) | **45.69** | 93 rounds, 418 accepted, 11.10 s |
+| **c4d** (prose, 4×512) | **108.51** | 112 rounds, 399 accepted, 18.87 s |
+| **p4d** (code, 4×512) | **111.32** | 53 rounds, 458 accepted, 18.40 s |
+| **c6d** (prose, 6×512) | **154.54** | 115 rounds, 396 accepted, 19.88 s |
+| **c4off** (drafter off) | — | 511 rounds, 0 accepted, 56.71 s |
+
+Prefill (first rep, cold): 8K **1668** · 16K **1572** · 32K **1373** · 64K **1321** tok/s (reps 2–3 are
+prefix-cached, ~0.13–0.24 s).
+
+> **The headline:** boot91 decode is **~2× slower than boot90** (c1d 45.6 vs 85–89 tok/s; c4d 108.5 vs
+> ~201; c6d 154.5 vs ~233). The regression tracks the v6-stride→v11 draft-module swap and is pending a
+> clean v6/v6 A/B; the operator kept v11 (`S≤8`).
 
 ## Known issues (open, measured)
 
@@ -340,6 +361,15 @@ Verified against the running pair: `qwen38-tf-rank0` on spark1 + `qwen38-tf-rank
    serial reference is not the production path, but the drop suggests the batch gate interacts with drafter-off.
 5. **Engine image is `v0.6.0` (2026-10-01) vs upstream `v1.1.8` (2026-10-28)** — five patch releases behind. The
    `v0.6.0 → v1.1.8` canary is **gated** and deferred to an operator window (no unattended swap).
+6. **boot91 ~2× decode regression vs boot90** — c1d **45.6** vs **85–89** tok/s (c4d 108.5 vs ~201, c6d 154.5 vs
+   ~233). The v6-stride→v11 draft-module swap is the prime suspect; a clean v6/v6 A/B (v6 draft + boot91 launch) is
+   pending. Operator kept v11 (`S≤8`).
+7. **RoCE link degraded** — **109.16 Gb/s of the 200G** link, with lane-0 PHY errors (pre-existing). Caps cross-rank
+   collectives; not caused by boot91.
+8. **boot91 Phases 2–3 not done** — the router/governor (`decision_router_gguf`, `governor.py`), LiteLLM, llama-swap
+   and watchdog were **not touched**; boot91 is the engine geometry only.
+9. **boot91 was uncommitted** — spark1's repo is at `f0e2f6f boot90`; the GitHub fork was at boot80 docs until this
+   commit. The live `launch-tp2.sh` (`194b3996`) and `tp2draftgraph.py` (`44e592fd`) are now synced into this repo.
 
 ## Learned
 
@@ -356,6 +386,13 @@ Verified against the running pair: `qwen38-tf-rank0` on spark1 + `qwen38-tf-rank
   patch-level.
 - **Speculative decode is only as good as its acceptance rate** — 28–39% acceptance means most proposals are rejected;
   tune the draft tree / acceptance threshold before adding more streams.
+- **The launcher hardcodes `PAR`/`CTX`** — boot91's geometry is edited in `launch-tp2.sh`, not overridable by env;
+  changing slots means editing the file on both ranks and relaunching.
+- **There is no systemd unit for the pair** — launch is `stop-tp2.sh` + `nohup qwen38-tf-swap-up.sh`; no restart-on-boot.
+- **The v11 draft suite costs ~2× decode vs v6-stride** — acceptance alone doesn't explain it; the draft-suite change
+  is the variable to A/B before trusting boot91 as production.
+- **Benchmark harness pitfalls** — arg order matters (`bench_model.py --model … --base-url …`), and compound ssh
+  commands can truncate on quoting; run one command per ssh call.
 
 ## To do
 
@@ -368,5 +405,10 @@ Verified against the running pair: `qwen38-tf-rank0` on spark1 + `qwen38-tf-rank
 - [ ] **`c4off` regression** — trace the drafter-off batch-gate interaction (38.60 vs 246 tok/s).
 - [ ] **`v0.6.0 → v1.1.8` canary** — staged, gated; run in an operator window, verify `.so` load path + parity + needle
       before promoting.
-- [ ] **Reconcile docs with live config** — `MEMORY_RESERVE_GIB` is 16 live vs 24 documented; `KV_POOL_GIB=16` gives a
-      256K live window, not 1M. Either restore the documented values or update the tables to the resident config.
+- [ ] **Commit boot91** — create the boot91 commit in spark1's repo and push to `origin/main` (the synced
+      `launch-tp2.sh` + `tp2draftgraph.py` are staged in this fork now).
+- [ ] **Clean v6/v6 A/B** — v6-stride draft + boot91 launch, to isolate the ~2× regression before promoting boot91.
+- [ ] **boot91 Phases 2–3** — router/governor re-point, LiteLLM, llama-swap, watchdog (untouched).
+- [ ] **Re-run parity** — boot91 determinism / cross-stream parity gate.
+- [ ] **RoCE fix** — lane-0 PHY errors; restore ~200 Gb/s before trusting cross-rank numbers.
+- [ ] **Reconcile docs with live geometry** — PAR=6 × 262,144 (1,572,864 pooled, 24 GiB fp8/rank); `RESERVE_GIB=16`.

@@ -64,13 +64,17 @@ ROLE="${1:-head}"
 MODEL=TensorFold/Qwen3.8-27B-MLX-8bit
 IMAGE=tensorfold-qwen38-27b:v0.6.0-idlebell
 PORT=8894
-CTX=262144    # Phase 3 10-23: 4 x 262,144 = 1,048,576 pooled slots (16 GiB fp8 KV/rank)
-PAR=4
+CTX=262144    # Phase 3 10-23: 6 x 262,144 = 1,572,864 pooled tokens (24 GiB fp8 KV/rank) — boot91
+PAR=6
 MASTER=10.100.8.2
 SOCK_IF=enp1s0f1np1
 IB_HCA=rocep1s0f1
+# RoCE jumbo self-heal (2026-10-27): 9000 MTU is not persisted; reboot resets to 1500
+# and NCCL allreduce degrades ~4x. Idempotent no-op when already 9000.
+_MTU_NOW=$(ip link show $SOCK_IF 2>/dev/null | awk '/mtu/{print $5; exit}')
+if [ "$_MTU_NOW" != "9000" ]; then (echo "" | sudo -S ip link set dev $SOCK_IF mtu 9000 2>/dev/null || ip link set dev $SOCK_IF mtu 9000 2>/dev/null) || true; fi
 # Co-host protection: symmetric hard reserve on BOTH ranks (never auto, never 0).
-RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-24}"
+RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-16}"
 # KV pool pin: single-GPU fallback only — engine.py:121 gates the pre-faulted
 # pool to tp==1, so at TP=2 this is a no-op (KV grows on demand). Never auto.
 KV_POOL_GIB="${TENSORFOLD_KV_POOL_GIB:-16}"
@@ -157,6 +161,7 @@ docker run -d --name "$NAME" \
   -e TP2_CUDA_GRAPHS="${TP2_CUDA_GRAPHS:-1}" \
   -e TP2_V11_GRAPH="${TP2_V11_GRAPH:-0}" -e TP2_V11_TARGET_GRAPH="${TP2_V11_TARGET_GRAPH:-0}" \
   -e TP2_PREFILL_FP8_GATHER="${TP2_PREFILL_FP8_GATHER:-0}" \
+  -e TP2_PREFILL_MODE="${TP2_PREFILL_MODE:-b}" -e TP2_PREFILL_THRESH="${TP2_PREFILL_THRESH:-512}" \
   -e TP2_GRAPH_D="${TP2_GRAPH_D:-0}" \
   -e TF_SLOT_KV_CAP="$TF_SLOT_KV_CAP" \
   -e TF_PROF_ROUNDS="$TF_PROF_ROUNDS" \
@@ -169,6 +174,7 @@ docker run -d --name "$NAME" \
   -e NCCL_IB_HCA=$IB_HCA -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_ROCE_VERSION_NUM=2 \
   -e NCCL_IB_DISABLE=0 -e NCCL_IB_MERGE_NICS=0 -e NCCL_CROSS_NIC=0 \
   -e NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-33554432}" \
+  -e NCCL_IB_QPS_PER_CONNECTION="${NCCL_IB_QPS_PER_CONNECTION:-4}" \
   -e NCCL_NET_PLUGIN=none -e NCCL_NET=IB \
   -e NCCL_NVLS_ENABLE=0 -e NCCL_CUMEM_ENABLE=0 -e NCCL_MULTI_RANK_GPU_ENABLE=1 \
   -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
@@ -187,7 +193,7 @@ docker run -d --name "$NAME" \
   -v /var/tmp/tf-snapshots:/snapshots \
   "$IMAGE" \
   numactl --cpunodebind=0 --membind=0 tensorfold serve "$MODEL" --tp 2 --master "$MASTER" "${RANKARGS[@]}" \
-    --parallel "$PAR" --context "$CTX" --prompt-cache-gib 16 --no-prefill-fp8 \
+    --parallel "$PAR" --context "$CTX" --prompt-cache-gib 32 --no-prefill-fp8 \
     --checkpoint-slots 32 --snapshot-dir /snapshots \
     --thinking --temperature 1.0 --top-p 0.95 --top-k 20 "${DRAFT_FLAGS[@]}"   # --vision dropped (text/code/agent traffic only)
 

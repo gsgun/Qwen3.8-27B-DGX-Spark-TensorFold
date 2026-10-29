@@ -1,3 +1,16 @@
+## 2026-10-28 — boot91 live (PAR=6 · v11 draft · ~2× decode regression open)
+
+- **Current production build corrected to `boot91`**: `boot80` + PAR=6 (6 × 262,144 = 1,572,864 pooled tokens, 24 GiB
+  fp8 KV/rank), v11 draft suite (`S≤8`, `tp2draftgraph.py` `44e592fd`), RoCE MTU-9000 self-heal, `RESERVE_GIB=16`,
+  `--prompt-cache-gib 32`, `TP2_PREFILL_MODE` passthrough, `NCCL_IB_QPS_PER_CONNECTION=4`.
+- **Source synced to live**: `launch-tp2.sh` (`194b3996`) and `patches/tp2draftgraph.py` (`44e592fd`) copied from
+  spark1; `bash -n` / `py_compile` clean.
+- **Measured scorecard** (21:48–21:57 PDT): c1d **45.59**, p1d 45.69, c4d 108.51, p4d 111.32, c6d 154.54 tok/s;
+  prefill 8K 1668 / 16K 1572 / 32K 1373 / 64K 1321 (first rep).
+- **Open**: ~2× decode regression vs boot90 (c1d 45.6 vs 85–89) — v6-stride→v11 draft swap suspect, clean A/B pending;
+  RoCE at 109.16 Gb/s of 200G with lane-0 PHY errors; boot91 Phases 2–3 (router/governor/LiteLLM/llama-swap/watchdog)
+  untouched; boot91 previously uncommitted (spark1 repo at `f0e2f6f boot90`).
+
 ## 2026-10-28 — Live state, known issues, and To-do (`boot80` resident)
 
 - **Current production build is `boot80`** (`8b57000`): `boot79` hybrid (`b8440d18` Mode A prefill + v10e eager
