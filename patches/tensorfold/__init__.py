@@ -114,3 +114,15 @@ try:
 except Exception as _e:  # an optional patch must never break the server
     _sys.stderr.write(f"tp2fp8gather: install failed: {_e!r}\n")
     _sys.stderr.flush()
+
+# 0010 (boot92): release kept/viewed-state storage + PAR*GROW admission headroom
+# + gate/round telemetry. TP2_KEPTFIX=0 disables.
+if _os.environ.get("TP2_KEPTFIX", "1") != "0":
+    try:
+        from tp2keptfix import install as _install_kept
+
+        _install_kept()
+        _sys.stderr.write("tp2keptfix: installed (boot92 kept/headroom/telemetry)\n")
+    except Exception as _e:  # an optional patch must never break the server
+        _sys.stderr.write(f"tp2keptfix: install failed: {_e!r}\n")
+        _sys.stderr.flush()

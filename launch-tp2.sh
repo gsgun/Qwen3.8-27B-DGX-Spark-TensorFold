@@ -195,7 +195,7 @@ docker run -d --name "$NAME" \
   numactl --cpunodebind=0 --membind=0 tensorfold serve "$MODEL" --tp 2 --master "$MASTER" "${RANKARGS[@]}" \
     --parallel "$PAR" --context "$CTX" --prompt-cache-gib 32 --no-prefill-fp8 \
     --checkpoint-slots 32 --snapshot-dir /snapshots \
-    --thinking --temperature 1.0 --top-p 0.95 --top-k 20 "${DRAFT_FLAGS[@]}"   # --vision dropped (text/code/agent traffic only)
+    --thinking --temperature 0.2 --top-p 0.80 --top-k 20 "${DRAFT_FLAGS[@]}"   # --vision dropped (text/code/agent traffic only)
 
 echo "launched $NAME ($(date +%T)) ctx=$CTX par=$PAR reserve=${RESERVE_GIB}GiB kvpool=${KV_POOL_GIB}GiB(yarn=${YARN_FACTOR:-native}) drafts=${DRAFTS_ON}"
 docker logs --tail 5 "$NAME" 2>&1 | head -8
